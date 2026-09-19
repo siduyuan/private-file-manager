@@ -1,0 +1,55 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+}
+
+/* Override Ant Design layout heights */
+.ant-layout-header {
+  line-height: 48px !important;
+  height: 48px !important;
+}
+
+.ant-layout-footer {
+  height: 28px !important;
+  line-height: 28px !important;
+  padding: 0 16px !important;
+}
+
+/* File list table row hover */
+.ant-table-row {
+  cursor: pointer;
+}
+
+.ant-table-row:hover {
+  background-color: #fafafa;
+}
+
+/* Tree node style */
+.ant-tree-node-content-wrapper {
+  display: flex;
+  align-items: center;
+}
+
+/* Scrollbar style */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #d9d9d9;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #bfbfbf;
+}
