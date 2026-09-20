@@ -9,7 +9,6 @@ import {
   DeleteOutlined,
   EditOutlined,
   FolderAddOutlined,
-  SearchOutlined,
   HomeOutlined,
   AppstoreOutlined,
   UnorderedListOutlined,
@@ -84,6 +83,8 @@ function App() {
   const [renameFileId, setRenameFileId] = useState<number | null>(null);
   const [newFolderModalOpen, setNewFolderModalOpen] = useState(false);
   const [newFolderName, setNewFolderName] = useState('');
+  const [expandedKeys, setExpandedKeys] = useState<React.Key[]>([1]); // 默认展开根目录
+  const [currentFolders, setCurrentFolders] = useState<FolderInfo[]>([]); // 当前目录下的子文件夹
 
   const loadFolders = useCallback(async () => {
     try {
@@ -99,13 +100,16 @@ function App() {
     try {
       const result = await invoke<FileInfo[]>('get_files_in_folder', { folderId });
       setFiles(result);
+      // 同时获取当前目录下的子文件夹
+      const subFolders = folders.filter(f => f.parent_id === folderId);
+      setCurrentFolders(subFolders);
     } catch (e) {
       console.error('Failed to load files:', e);
       message.error('加载文件失败');
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [folders]);
 
   useEffect(() => {
     loadFolders();
@@ -343,48 +347,6 @@ function App() {
     },
   ];
 
-  const columns = [
-    {
-      title: '文件名',
-      dataIndex: 'name',
-      key: 'name',
-      render: (name: string, record: FileInfo) => (
-        <span>
-          {getFileIcon(record.category)} {name}
-        </span>
-      ),
-    },
-    {
-      title: '大小',
-      dataIndex: 'size_bytes',
-      key: 'size',
-      width: 100,
-      render: (size: number) => formatFileSize(size),
-    },
-    {
-      title: '类型',
-      dataIndex: 'category',
-      key: 'category',
-      width: 80,
-      render: (cat: string) => {
-        switch (cat) {
-          case 'image': return '图片';
-          case 'video_short': return '短视频';
-          case 'video_long': return '长视频';
-          case 'doc': return '文档';
-          default: return cat || '-';
-        }
-      },
-    },
-    {
-      title: '修改时间',
-      dataIndex: 'updated_at',
-      key: 'updated_at',
-      width: 180,
-      render: (t: number) => formatTime(t),
-    },
-  ];
-
   return (
     <Layout style={{ height: '100vh' }}>
       {/* Toolbar */}
@@ -433,7 +395,8 @@ function App() {
           </div>
           <Tree
             showIcon
-            defaultExpandAll
+            expandedKeys={expandedKeys}
+            onExpand={(keys) => setExpandedKeys(keys)}
             treeData={buildTreeData(folders)}
             selectedKeys={[currentFolderId]}
             onSelect={handleFolderSelect}
@@ -464,18 +427,82 @@ function App() {
           {/* File List / Grid */}
           {viewMode === 'list' ? (
             <Table
-              dataSource={files}
-              columns={columns}
-              rowKey="file_id"
+              dataSource={[
+                // 文件夹
+                ...currentFolders.map(f => ({
+                  key: `folder-${f.folder_id}`,
+                  file_id: f.folder_id,
+                  name: f.name,
+                  size_bytes: 0,
+                  category: 'folder',
+                  updated_at: f.created_at,
+                  isFolder: true,
+                })),
+                // 文件
+                ...files.map(f => ({ ...f, isFolder: false })),
+              ]}
+              columns={[
+                {
+                  title: '文件名',
+                  dataIndex: 'name',
+                  key: 'name',
+                  render: (name: string, record: any) => (
+                    <span>
+                      {record.isFolder ? <FolderOutlined style={{ color: '#faad14' }} /> : getFileIcon(record.category)} {name}
+                    </span>
+                  ),
+                },
+                {
+                  title: '大小',
+                  dataIndex: 'size_bytes',
+                  key: 'size',
+                  width: 100,
+                  render: (size: number, record: any) => record.isFolder ? '-' : formatFileSize(size),
+                },
+                {
+                  title: '类型',
+                  dataIndex: 'category',
+                  key: 'category',
+                  width: 80,
+                  render: (cat: string, record: any) => {
+                    if (record.isFolder) return '文件夹';
+                    switch (cat) {
+                      case 'image': return '图片';
+                      case 'video_short': return '短视频';
+                      case 'video_long': return '长视频';
+                      case 'doc': return '文档';
+                      default: return cat || '-';
+                    }
+                  },
+                },
+                {
+                  title: '修改时间',
+                  dataIndex: 'updated_at',
+                  key: 'updated_at',
+                  width: 180,
+                  render: (t: number) => formatTime(t),
+                },
+              ]}
               loading={loading}
               pagination={false}
               size="small"
               rowSelection={{
                 selectedRowKeys: selectedFileIds,
-                onChange: (keys) => setSelectedFileIds(keys as number[]),
+                onChange: (keys) => setSelectedFileIds(keys.filter(k => typeof k === 'number') as number[]),
+                getCheckboxProps: (record: any) => ({
+                  disabled: record.isFolder, // 文件夹不可选
+                }),
               }}
-              onRow={(record) => ({
-                onDoubleClick: () => handleOpenFile(record.file_id),
+              onRow={(record: any) => ({
+                onDoubleClick: () => {
+                  if (record.isFolder) {
+                    // 进入文件夹
+                    setCurrentFolderId(record.file_id);
+                    setExpandedKeys(prev => [...prev, record.file_id]);
+                  } else {
+                    handleOpenFile(record.file_id);
+                  }
+                },
                 onContextMenu: (e) => {
                   e.preventDefault();
                 },
@@ -484,6 +511,40 @@ function App() {
             />
           ) : (
             <div style={{ padding: 16, display: 'flex', flexWrap: 'wrap', gap: 12, overflow: 'auto' }}>
+              {/* 文件夹 */}
+              {currentFolders.map(folder => (
+                <div
+                  key={`folder-${folder.folder_id}`}
+                  style={{
+                    width: 120,
+                    padding: 8,
+                    textAlign: 'center',
+                    borderRadius: 4,
+                    border: '1px solid #f0f0f0',
+                    cursor: 'pointer',
+                  }}
+                  onDoubleClick={() => {
+                    setCurrentFolderId(folder.folder_id);
+                    setExpandedKeys(prev => [...prev, folder.folder_id]);
+                  }}
+                >
+                  <div style={{ fontSize: 40, marginBottom: 4 }}>
+                    <FolderOutlined style={{ color: '#faad14' }} />
+                  </div>
+                  <div style={{
+                    fontSize: 12,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}>
+                    {folder.name}
+                  </div>
+                  <div style={{ fontSize: 11, color: '#999' }}>
+                    文件夹
+                  </div>
+                </div>
+              ))}
+              {/* 文件 */}
               {files.map(file => (
                 <Dropdown
                   key={file.file_id}
