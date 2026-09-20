@@ -103,9 +103,11 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT f.file_id, f.name, f.ext, f.mime_type, f.size_bytes,
                     f.duration_sec, f.width, f.height, f.category,
+                    t.thumb_path,
                     f.created_at, f.updated_at
              FROM files f
              JOIN file_folder ff ON f.file_id = ff.file_id
+             LEFT JOIN thumbnail_index t ON f.file_id = t.file_id
              WHERE ff.folder_id = ?
              ORDER BY f.name"
         )?;
@@ -120,8 +122,9 @@ impl Database {
                 width: row.get(6)?,
                 height: row.get(7)?,
                 category: row.get(8)?,
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
+                thumbnail_path: row.get(9)?,
+                created_at: row.get(10)?,
+                updated_at: row.get(11)?,
             })
         })?.collect::<Result<Vec<_>>>()?;
         Ok(files)
@@ -263,6 +266,43 @@ impl Database {
         Ok(chunks)
     }
 
+    pub fn delete_folder(&self, folder_id: i64) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        
+        // 递归删除文件夹及其所有子文件夹
+        // 先删除所有子文件夹中的文件关联
+        tx.execute(
+            "DELETE FROM file_folder WHERE folder_id IN (
+                WITH RECURSIVE subfolders AS (
+                    SELECT folder_id FROM folders WHERE folder_id = ?
+                    UNION ALL
+                    SELECT f.folder_id FROM folders f
+                    JOIN subfolders s ON f.parent_id = s.folder_id
+                )
+                SELECT folder_id FROM subfolders
+            )",
+            params![folder_id],
+        )?;
+        
+        // 删除所有子文件夹
+        tx.execute(
+            "DELETE FROM folders WHERE folder_id IN (
+                WITH RECURSIVE subfolders AS (
+                    SELECT folder_id FROM folders WHERE folder_id = ?
+                    UNION ALL
+                    SELECT f.folder_id FROM folders f
+                    JOIN subfolders s ON f.parent_id = s.folder_id
+                )
+                SELECT folder_id FROM subfolders
+            )",
+            params![folder_id],
+        )?;
+        
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn rename_file(&self, file_id: i64, new_name: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let ext = Path::new(new_name)
@@ -312,10 +352,13 @@ impl Database {
     pub fn get_file_info(&self, file_id: i64) -> Result<Option<FileInfo>> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
-            "SELECT file_id, name, ext, mime_type, size_bytes,
-                    duration_sec, width, height, category,
-                    created_at, updated_at
-             FROM files WHERE file_id = ?",
+            "SELECT f.file_id, f.name, f.ext, f.mime_type, f.size_bytes,
+                    f.duration_sec, f.width, f.height, f.category,
+                    t.thumb_path,
+                    f.created_at, f.updated_at
+             FROM files f
+             LEFT JOIN thumbnail_index t ON f.file_id = t.file_id
+             WHERE f.file_id = ?",
             params![file_id],
             |row| {
                 Ok(FileInfo {
@@ -328,8 +371,9 @@ impl Database {
                     width: row.get(6)?,
                     height: row.get(7)?,
                     category: row.get(8)?,
-                    created_at: row.get(9)?,
-                    updated_at: row.get(10)?,
+                    thumbnail_path: row.get(9)?,
+                    created_at: row.get(10)?,
+                    updated_at: row.get(11)?,
                 })
             }
         );
@@ -344,10 +388,13 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let pattern = format!("%{}%", keyword);
         let mut stmt = conn.prepare(
-            "SELECT file_id, name, ext, mime_type, size_bytes,
-                    duration_sec, width, height, category,
-                    created_at, updated_at
-             FROM files WHERE name LIKE ? ORDER BY name LIMIT 50"
+            "SELECT f.file_id, f.name, f.ext, f.mime_type, f.size_bytes,
+                    f.duration_sec, f.width, f.height, f.category,
+                    t.thumb_path,
+                    f.created_at, f.updated_at
+             FROM files f
+             LEFT JOIN thumbnail_index t ON f.file_id = t.file_id
+             WHERE f.name LIKE ? ORDER BY f.name LIMIT 50"
         )?;
         let files = stmt.query_map(params![pattern], |row| {
             Ok(FileInfo {
@@ -360,8 +407,9 @@ impl Database {
                 width: row.get(6)?,
                 height: row.get(7)?,
                 category: row.get(8)?,
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
+                thumbnail_path: row.get(9)?,
+                created_at: row.get(10)?,
+                updated_at: row.get(11)?,
             })
         })?.collect::<Result<Vec<_>>>()?;
         Ok(files)

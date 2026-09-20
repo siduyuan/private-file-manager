@@ -14,6 +14,21 @@ import {
   UnorderedListOutlined,
   ReloadOutlined,
 } from '@ant-design/icons';
+import { 
+  FaFilePdf, 
+  FaFileWord, 
+  FaFileExcel, 
+  FaFilePowerpoint, 
+  FaFileArchive, 
+  FaFileCode, 
+  FaFileImage, 
+  FaFileVideo, 
+  FaFileAudio,
+  FaFileAlt,
+  FaFile,
+  FaMarkdown,
+  FaWindows
+} from 'react-icons/fa';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import type { DataNode } from 'antd/es/tree';
@@ -30,6 +45,7 @@ interface FileInfo {
   width: number | null;
   height: number | null;
   category: string | null;
+  thumbnail_path: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -58,12 +74,102 @@ function formatTime(timestamp: number): string {
   return new Date(timestamp * 1000).toLocaleString('zh-CN');
 }
 
-function getFileIcon(category: string | null) {
+function getFileIcon(category: string | null, ext?: string | null) {
+  const extension = ext?.toLowerCase();
+  
+  // 根据扩展名显示更精确的图标
+  if (extension) {
+    switch (extension) {
+      // 文档
+      case 'pdf':
+        return <FaFilePdf style={{ color: '#ff4d4f', fontSize: 16 }} />;
+      case 'doc':
+      case 'docx':
+        return <FaFileWord style={{ color: '#2b579a', fontSize: 16 }} />;
+      case 'xls':
+      case 'xlsx':
+        return <FaFileExcel style={{ color: '#217346', fontSize: 16 }} />;
+      case 'ppt':
+      case 'pptx':
+        return <FaFilePowerpoint style={{ color: '#d24726', fontSize: 16 }} />;
+      case 'txt':
+        return <FaFileAlt style={{ color: '#8c8c8c', fontSize: 16 }} />;
+      case 'md':
+        return <FaMarkdown style={{ color: '#083fa1', fontSize: 16 }} />;
+      
+      // 压缩包
+      case 'zip':
+      case 'rar':
+      case '7z':
+      case 'tar':
+      case 'gz':
+        return <FaFileArchive style={{ color: '#faad14', fontSize: 16 }} />;
+      
+      // 代码
+      case 'js':
+      case 'ts':
+      case 'jsx':
+      case 'tsx':
+      case 'py':
+      case 'java':
+      case 'cpp':
+      case 'c':
+      case 'h':
+      case 'cs':
+      case 'go':
+      case 'rs':
+      case 'html':
+      case 'css':
+      case 'json':
+      case 'xml':
+      case 'yaml':
+      case 'yml':
+        return <FaFileCode style={{ color: '#1890ff', fontSize: 16 }} />;
+      
+      // 可执行文件
+      case 'exe':
+      case 'msi':
+        return <FaWindows style={{ color: '#0078d4', fontSize: 16 }} />;
+      
+      // 图片
+      case 'jpg':
+      case 'jpeg':
+      case 'png':
+      case 'gif':
+      case 'bmp':
+      case 'webp':
+      case 'svg':
+      case 'ico':
+        return <FaFileImage style={{ color: '#52c41a', fontSize: 16 }} />;
+      
+      // 视频
+      case 'mp4':
+      case 'avi':
+      case 'mkv':
+      case 'mov':
+      case 'wmv':
+      case 'flv':
+      case 'webm':
+        return <FaFileVideo style={{ color: '#722ed1', fontSize: 16 }} />;
+      
+      // 音频
+      case 'mp3':
+      case 'wav':
+      case 'flac':
+      case 'aac':
+      case 'ogg':
+      case 'wma':
+        return <FaFileAudio style={{ color: '#eb2f96', fontSize: 16 }} />;
+    }
+  }
+  
+  // 根据类别显示默认图标
   switch (category) {
-    case 'image': return <span style={{ color: '#52c41a' }}>🖼</span>;
+    case 'image': return <FaFileImage style={{ color: '#52c41a', fontSize: 16 }} />;
     case 'video_short':
-    case 'video_long': return <span style={{ color: '#1890ff' }}>🎬</span>;
-    default: return <FileOutlined style={{ color: '#8c8c8c' }} />;
+    case 'video_long': return <FaFileVideo style={{ color: '#722ed1', fontSize: 16 }} />;
+    case 'doc': return <FaFileAlt style={{ color: '#8c8c8c', fontSize: 16 }} />;
+    default: return <FaFile style={{ color: '#8c8c8c', fontSize: 16 }} />;
   }
 }
 
@@ -141,19 +247,25 @@ function App() {
   const handleFolderSelect = (selectedKeys: React.Key[]) => {
     if (selectedKeys.length > 0) {
       const folderId = selectedKeys[0] as number;
-      setCurrentFolderId(folderId);
-      setSelectedFileIds([]);
-      setSearchKeyword('');
-
-      // Build breadcrumb path
-      const path: { id: number; name: string }[] = [];
-      let current = folders.find(f => f.folder_id === folderId);
-      while (current) {
-        path.unshift({ id: current.folder_id, name: current.name });
-        current = current.parent_id ? folders.find(f => f.folder_id === current!.parent_id) : undefined;
-      }
-      setBreadcrumb(path);
+      enterFolder(folderId);
     }
+  };
+
+  // 进入文件夹
+  const enterFolder = (folderId: number) => {
+    setCurrentFolderId(folderId);
+    setSelectedFileIds([]);
+    setSearchKeyword('');
+    setExpandedKeys(prev => prev.includes(folderId) ? prev : [...prev, folderId]);
+
+    // Build breadcrumb path
+    const path: { id: number; name: string }[] = [];
+    let current = folders.find(f => f.folder_id === folderId);
+    while (current) {
+      path.unshift({ id: current.folder_id, name: current.name });
+      current = current.parent_id ? folders.find(f => f.folder_id === current!.parent_id) : undefined;
+    }
+    setBreadcrumb(path);
   };
 
   const handleImportFiles = async () => {
@@ -239,13 +351,28 @@ function App() {
   const handleDelete = async (ids?: number[]) => {
     const targetIds = ids || selectedFileIds;
     if (targetIds.length === 0) return;
+    
+    // 区分文件和文件夹
+    const folderIds = currentFolders
+      .filter(f => targetIds.includes(f.folder_id))
+      .map(f => f.folder_id);
+    const fileIds = targetIds.filter(id => !folderIds.includes(id));
+    
     try {
-      for (const id of targetIds) {
+      // 删除文件夹
+      for (const id of folderIds) {
+        await invoke('delete_folder', { folderId: id });
+      }
+      // 删除文件
+      for (const id of fileIds) {
         await invoke('delete_file', { fileId: id });
       }
-      message.success(`已删除 ${targetIds.length} 个文件`);
+      
+      const totalCount = folderIds.length + fileIds.length;
+      message.success(`已删除 ${totalCount} 个项目`);
       setSelectedFileIds([]);
       loadFiles(currentFolderId);
+      loadFolders();
     } catch (e) {
       message.error('删除失败: ' + e);
     }
@@ -426,107 +553,148 @@ function App() {
 
           {/* File List / Grid */}
           {viewMode === 'list' ? (
-            <Table
-              dataSource={[
-                // 文件夹
-                ...currentFolders.map(f => ({
-                  key: `folder-${f.folder_id}`,
-                  file_id: f.folder_id,
-                  name: f.name,
-                  size_bytes: 0,
-                  category: 'folder',
-                  updated_at: f.created_at,
-                  isFolder: true,
-                })),
-                // 文件
-                ...files.map(f => ({ ...f, isFolder: false })),
-              ]}
-              columns={[
-                {
-                  title: '文件名',
-                  dataIndex: 'name',
-                  key: 'name',
-                  render: (name: string, record: any) => (
-                    <span>
-                      {record.isFolder ? <FolderOutlined style={{ color: '#faad14' }} /> : getFileIcon(record.category)} {name}
-                    </span>
-                  ),
-                },
-                {
-                  title: '大小',
-                  dataIndex: 'size_bytes',
-                  key: 'size',
-                  width: 100,
-                  render: (size: number, record: any) => record.isFolder ? '-' : formatFileSize(size),
-                },
-                {
-                  title: '类型',
-                  dataIndex: 'category',
-                  key: 'category',
-                  width: 80,
-                  render: (cat: string, record: any) => {
-                    if (record.isFolder) return '文件夹';
-                    switch (cat) {
-                      case 'image': return '图片';
-                      case 'video_short': return '短视频';
-                      case 'video_long': return '长视频';
-                      case 'doc': return '文档';
-                      default: return cat || '-';
+            <div
+              tabIndex={0}
+              onClick={() => setSelectedFileIds([])}
+              onKeyDown={(e) => {
+                if (e.ctrlKey && e.key === 'a') {
+                  e.preventDefault();
+                  const allIds = [
+                    ...currentFolders.map(f => f.folder_id),
+                    ...files.map(f => f.file_id),
+                  ];
+                  setSelectedFileIds(allIds);
+                }
+              }}
+              style={{ outline: 'none', height: '100%', overflow: 'auto', cursor: 'default' }}
+            >
+              <Table
+                dataSource={[
+                  ...currentFolders.map(f => ({
+                    key: `folder-${f.folder_id}`,
+                    file_id: f.folder_id,
+                    name: f.name,
+                    size_bytes: 0,
+                    category: 'folder',
+                    updated_at: f.created_at,
+                    isFolder: true,
+                  })),
+                  ...files.map(f => ({ ...f, isFolder: false })),
+                ]}
+                columns={[
+                  {
+                    title: '文件名',
+                    dataIndex: 'name',
+                    key: 'name',
+                    render: (name: string, record: any) => (
+                      <span>
+                        {record.isFolder ? <FolderOutlined style={{ color: '#faad14' }} /> : getFileIcon(record.category, record.ext)} {name}
+                      </span>
+                    ),
+                  },
+                  {
+                    title: '大小',
+                    dataIndex: 'size_bytes',
+                    key: 'size',
+                    width: 100,
+                    render: (size: number, record: any) => record.isFolder ? '-' : formatFileSize(size),
+                  },
+                  {
+                    title: '类型',
+                    dataIndex: 'category',
+                    key: 'category',
+                    width: 80,
+                    render: (cat: string, record: any) => {
+                      if (record.isFolder) return '文件夹';
+                      switch (cat) {
+                        case 'image': return '图片';
+                        case 'video_short': return '短视频';
+                        case 'video_long': return '长视频';
+                        case 'doc': return '文档';
+                        default: return cat || '-';
+                      }
+                    },
+                  },
+                  {
+                    title: '修改时间',
+                    dataIndex: 'updated_at',
+                    key: 'updated_at',
+                    width: 180,
+                    render: (t: number) => formatTime(t),
+                  },
+                ]}
+                pagination={false}
+                size="small"
+                rowClassName={(record: any) => selectedFileIds.includes(record.file_id) ? 'file-row file-row-selected' : 'file-row'}
+                onRow={(record: any) => ({
+                  onClick: (e) => {
+                    e.stopPropagation();
+                    if (e.ctrlKey) {
+                      setSelectedFileIds(prev =>
+                        prev.includes(record.file_id)
+                          ? prev.filter(id => id !== record.file_id)
+                          : [...prev, record.file_id]
+                      );
+                    } else {
+                      setSelectedFileIds([record.file_id]);
                     }
                   },
-                },
-                {
-                  title: '修改时间',
-                  dataIndex: 'updated_at',
-                  key: 'updated_at',
-                  width: 180,
-                  render: (t: number) => formatTime(t),
-                },
-              ]}
-              loading={loading}
-              pagination={false}
-              size="small"
-              rowSelection={{
-                selectedRowKeys: selectedFileIds,
-                onChange: (keys) => setSelectedFileIds(keys.filter(k => typeof k === 'number') as number[]),
-                getCheckboxProps: (record: any) => ({
-                  disabled: record.isFolder, // 文件夹不可选
-                }),
-              }}
-              onRow={(record: any) => ({
-                onDoubleClick: () => {
-                  if (record.isFolder) {
-                    // 进入文件夹
-                    setCurrentFolderId(record.file_id);
-                    setExpandedKeys(prev => [...prev, record.file_id]);
-                  } else {
-                    handleOpenFile(record.file_id);
-                  }
-                },
-                onContextMenu: (e) => {
-                  e.preventDefault();
-                },
-              })}
-              scroll={{ y: 'calc(100vh - 180px)' }}
-            />
+                  onDoubleClick: () => {
+                    if (record.isFolder) {
+                      enterFolder(record.file_id);
+                    } else {
+                      handleOpenFile(record.file_id);
+                    }
+                  },
+                  onContextMenu: (e) => {
+                    e.preventDefault();
+                  },
+                })}
+                scroll={{ y: 'calc(100vh - 180px)' }}
+              />
+            </div>
           ) : (
-            <div style={{ padding: 16, display: 'flex', flexWrap: 'wrap', gap: 12, overflow: 'auto' }}>
+            <div
+              tabIndex={0}
+              onKeyDown={(e) => {
+                // Ctrl+A 全选
+                if (e.ctrlKey && e.key === 'a') {
+                  e.preventDefault();
+                  const allIds = [
+                    ...currentFolders.map(f => f.folder_id),
+                    ...files.map(f => f.file_id),
+                  ];
+                  setSelectedFileIds(allIds);
+                }
+              }}
+              style={{ padding: 16, display: 'flex', flexWrap: 'wrap', gap: 12, overflow: 'auto', outline: 'none', cursor: 'default' }}
+              onClick={() => setSelectedFileIds([])}
+            >
               {/* 文件夹 */}
               {currentFolders.map(folder => (
                 <div
                   key={`folder-${folder.folder_id}`}
+                  className={`grid-item ${selectedFileIds.includes(folder.folder_id) ? 'grid-item-selected' : ''}`}
                   style={{
                     width: 120,
                     padding: 8,
                     textAlign: 'center',
                     borderRadius: 4,
-                    border: '1px solid #f0f0f0',
-                    cursor: 'pointer',
+                    border: selectedFileIds.includes(folder.folder_id) ? '2px solid #1890ff' : '1px solid #f0f0f0',
                   }}
-                  onDoubleClick={() => {
-                    setCurrentFolderId(folder.folder_id);
-                    setExpandedKeys(prev => [...prev, folder.folder_id]);
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (e.ctrlKey) {
+                      setSelectedFileIds(prev =>
+                        prev.includes(folder.folder_id)
+                          ? prev.filter(id => id !== folder.folder_id)
+                          : [...prev, folder.folder_id]
+                      );
+                    } else {
+                      setSelectedFileIds([folder.folder_id]);
+                    }
                   }}
+                  onDoubleClick={() => enterFolder(folder.folder_id)}
                 >
                   <div style={{ fontSize: 40, marginBottom: 4 }}>
                     <FolderOutlined style={{ color: '#faad14' }} />
@@ -552,17 +720,17 @@ function App() {
                   trigger={['contextMenu']}
                 >
                   <div
+                    className={`grid-item ${selectedFileIds.includes(file.file_id) ? 'grid-item-selected' : ''}`}
                     style={{
                       width: 120,
                       padding: 8,
                       textAlign: 'center',
                       borderRadius: 4,
                       border: selectedFileIds.includes(file.file_id) ? '2px solid #1890ff' : '1px solid #f0f0f0',
-                      cursor: 'pointer',
-                      background: selectedFileIds.includes(file.file_id) ? '#e6f7ff' : '#fff',
                     }}
                     onDoubleClick={() => handleOpenFile(file.file_id)}
                     onClick={(e) => {
+                      e.stopPropagation();
                       if (e.ctrlKey) {
                         setSelectedFileIds(prev =>
                           prev.includes(file.file_id)
@@ -574,8 +742,18 @@ function App() {
                       }
                     }}
                   >
-                    <div style={{ fontSize: 40, marginBottom: 4 }}>
-                      {getFileIcon(file.category)}
+                    <div style={{ width: 80, height: 80, marginBottom: 4, display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}>
+                      {file.thumbnail_path ? (
+                        <img 
+                          src={`file://${file.thumbnail_path}`}
+                          alt={file.name}
+                          style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'cover' }}
+                        />
+                      ) : (
+                        <div style={{ fontSize: 40 }}>
+                          {getFileIcon(file.category, file.ext)}
+                        </div>
+                      )}
                     </div>
                     <div style={{
                       fontSize: 12,

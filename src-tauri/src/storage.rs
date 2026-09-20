@@ -78,6 +78,7 @@ pub fn import_file(
         width: None,
         height: None,
         category,
+        thumbnail_path: None,
         created_at: now,
         updated_at: now,
     };

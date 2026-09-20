@@ -11,7 +11,6 @@ use models::*;
 
 struct AppState {
     db: Database,
-    data_dir: PathBuf,
     store_dir: PathBuf,
     thumb_dir: PathBuf,
     temp_dir: PathBuf,
@@ -237,6 +236,15 @@ fn delete_file(
 }
 
 #[tauri::command]
+fn delete_folder(
+    state: tauri::State<Mutex<AppState>>,
+    folder_id: i64,
+) -> Result<(), String> {
+    let state = state.lock().unwrap();
+    state.db.delete_folder(folder_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn rename_file(
     state: tauri::State<Mutex<AppState>>,
     file_id: i64,
@@ -354,7 +362,6 @@ pub fn run() {
 
             let state = AppState {
                 db: database,
-                data_dir: app_data_dir,
                 store_dir,
                 thumb_dir,
                 temp_dir,
@@ -371,6 +378,7 @@ pub fn run() {
             export_files,
             open_file,
             delete_file,
+            delete_folder,
             rename_file,
             move_file,
             search_files,

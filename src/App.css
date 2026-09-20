@@ -20,13 +20,51 @@ body {
   padding: 0 16px !important;
 }
 
-/* File list table row hover */
+/* File list table row */
 .ant-table-row {
   cursor: pointer;
+  user-select: none;
 }
 
-.ant-table-row:hover {
-  background-color: #fafafa;
+/* Override Ant Design default hover styles */
+.ant-table-tbody > tr:hover > td,
+.ant-table-tbody > tr.ant-table-row:hover > td,
+.ant-table-tbody > tr > td:hover {
+  background-color: #e6f7ff !important;
+}
+
+.file-row:hover {
+  background-color: #e6f7ff !important;
+}
+
+.file-row-selected,
+.file-row-selected > td {
+  background-color: #bae7ff !important;
+}
+
+.file-row-selected:hover,
+.file-row-selected:hover > td {
+  background-color: #91d5ff !important;
+}
+
+/* Grid view items */
+.grid-item {
+  cursor: pointer;
+  user-select: none;
+  transition: background-color 0.2s;
+}
+
+.grid-item:hover {
+  background-color: #e6f7ff !important;
+}
+
+.grid-item-selected {
+  background-color: #bae7ff !important;
+  border-color: #1890ff !important;
+}
+
+.grid-item-selected:hover {
+  background-color: #91d5ff !important;
 }
 
 /* Tree node style */

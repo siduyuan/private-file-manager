@@ -11,6 +11,7 @@ pub struct FileInfo {
     pub width: Option<i32>,
     pub height: Option<i32>,
     pub category: Option<String>,
+    pub thumbnail_path: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -37,12 +38,4 @@ pub struct ImportResult {
     pub success_count: i32,
     pub fail_count: i32,
     pub errors: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FolderTreeNode {
-    pub folder_id: i64,
-    pub name: String,
-    pub parent_id: Option<i64>,
-    pub children: Vec<FolderTreeNode>,
 }
