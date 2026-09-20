@@ -1,11 +1,12 @@
 use rusqlite::{Connection, Result, params};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::models::*;
 
+#[derive(Clone)]
 pub struct Database {
-    pub conn: Mutex<Connection>,
+    pub conn: Arc<Mutex<Connection>>,
 }
 
 impl Database {
@@ -13,7 +14,7 @@ impl Database {
         let conn = Connection::open(db_path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         let db = Database {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
         };
         db.init_tables()?;
         Ok(db)
@@ -238,7 +239,21 @@ impl Database {
 
     pub fn delete_file(&self, file_id: i64) -> Result<Vec<ChunkLocation>> {
         let mut conn = self.conn.lock().unwrap();
-        let chunks = self.get_chunk_locations(file_id)?;
+        // Query chunks inline to avoid re-locking
+        let mut stmt = conn.prepare(
+            "SELECT file_id, chunk_index, store_file, offset, length
+             FROM chunk_locations WHERE file_id = ? ORDER BY chunk_index"
+        )?;
+        let chunks = stmt.query_map(params![file_id], |row| {
+            Ok(ChunkLocation {
+                file_id: row.get(0)?,
+                chunk_index: row.get(1)?,
+                store_file: row.get(2)?,
+                offset: row.get(3)?,
+                length: row.get(4)?,
+            })
+        })?.collect::<Result<Vec<_>>>()?;
+        drop(stmt);
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM chunk_locations WHERE file_id = ?", params![file_id])?;
         tx.execute("DELETE FROM thumbnail_index WHERE file_id = ?", params![file_id])?;

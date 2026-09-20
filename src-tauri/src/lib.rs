@@ -2,7 +2,7 @@ mod db;
 mod models;
 mod storage;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use tauri::Manager;
@@ -43,29 +43,41 @@ fn create_folder(
 }
 
 #[tauri::command]
-fn import_files(
-    state: tauri::State<Mutex<AppState>>,
+async fn import_files(
+    state: tauri::State<'_, Mutex<AppState>>,
     file_paths: Vec<String>,
     folder_id: i64,
 ) -> Result<ImportResult, String> {
-    let state = state.lock().unwrap();
+    let (db, store_dir, thumb_dir, temp_dir) = {
+        let state = state.lock().unwrap();
+        (
+            state.db.clone(),
+            state.store_dir.clone(),
+            state.thumb_dir.clone(),
+            state.temp_dir.clone(),
+        )
+    };
+
     let mut success_count = 0;
     let mut fail_count = 0;
     let mut errors = Vec::new();
 
+    // Process each path
     for path_str in &file_paths {
         let path = PathBuf::from(path_str);
+        
         if path.is_file() {
-            match storage::import_file(&state.db, &state.store_dir, &path, folder_id) {
+            // Import single file directly to target folder
+            match storage::import_file(&db, &store_dir, &path, folder_id) {
                 Ok(file_id) => {
-                    // Try to generate thumbnail for images
+                    // Generate thumbnail for images
                     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                     if matches!(ext.to_lowercase().as_str(), "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp") {
                         let _ = storage::generate_image_thumbnail(
-                            &state.db,
-                            &state.store_dir,
-                            &state.thumb_dir,
-                            &state.temp_dir,
+                            &db,
+                            &store_dir,
+                            &thumb_dir,
+                            &temp_dir,
                             file_id,
                         );
                     }
@@ -77,39 +89,11 @@ fn import_files(
                 }
             }
         } else if path.is_dir() {
-            // Import all files in directory
-            if let Ok(entries) = std::fs::read_dir(&path) {
-                for entry in entries.flatten() {
-                    let entry_path = entry.path();
-                    if entry_path.is_file() {
-                        match storage::import_file(
-                            &state.db,
-                            &state.store_dir,
-                            &entry_path,
-                            folder_id,
-                        ) {
-                            Ok(file_id) => {
-                                let ext = entry_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                                if matches!(ext.to_lowercase().as_str(), "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp") {
-                                    let _ = storage::generate_image_thumbnail(
-                                        &state.db,
-                                        &state.store_dir,
-                                        &state.thumb_dir,
-                                        &state.temp_dir,
-                                        file_id,
-                                    );
-                                }
-                                success_count += 1;
-                            }
-                            Err(e) => {
-                                fail_count += 1;
-                                let p = entry_path.to_str().unwrap_or("?");
-                                errors.push(format!("{}: {}", p, e));
-                            }
-                        }
-                    }
-                }
-            }
+            // Import directory: create folder structure first, then import files
+            let result = import_directory(&db, &store_dir, &thumb_dir, &temp_dir, &path, folder_id);
+            success_count += result.0;
+            fail_count += result.1;
+            errors.extend(result.2);
         }
     }
 
@@ -118,6 +102,81 @@ fn import_files(
         fail_count,
         errors,
     })
+}
+
+// Import a directory with its structure preserved
+fn import_directory(
+    db: &db::Database,
+    store_dir: &Path,
+    thumb_dir: &Path,
+    temp_dir: &Path,
+    source_dir: &Path,
+    target_folder_id: i64,
+) -> (i32, i32, Vec<String>) {
+    let mut success_count = 0;
+    let mut fail_count = 0;
+    let mut errors = Vec::new();
+
+    // Get the directory name
+    let dir_name = source_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("imported_folder");
+
+    // Create a new folder in the target location
+    let new_folder_id = match db.create_folder(dir_name, Some(target_folder_id)) {
+        Ok(id) => id,
+        Err(e) => {
+            errors.push(format!("创建文件夹 {} 失败: {}", dir_name, e));
+            return (0, 1, errors);
+        }
+    };
+
+    // Read directory contents
+    let entries = match std::fs::read_dir(source_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            errors.push(format!("读取目录 {} 失败: {}", source_dir.display(), e));
+            return (0, 1, errors);
+        }
+    };
+
+    // Process each entry
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        
+        if entry_path.is_file() {
+            // Import file to the newly created folder
+            match storage::import_file(db, store_dir, &entry_path, new_folder_id) {
+                Ok(file_id) => {
+                    // Generate thumbnail for images
+                    let ext = entry_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    if matches!(ext.to_lowercase().as_str(), "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp") {
+                        let _ = storage::generate_image_thumbnail(
+                            db,
+                            store_dir,
+                            thumb_dir,
+                            temp_dir,
+                            file_id,
+                        );
+                    }
+                    success_count += 1;
+                }
+                Err(e) => {
+                    fail_count += 1;
+                    errors.push(format!("{}: {}", entry_path.display(), e));
+                }
+            }
+        } else if entry_path.is_dir() {
+            // Recursively import subdirectory
+            let result = import_directory(db, store_dir, thumb_dir, temp_dir, &entry_path, new_folder_id);
+            success_count += result.0;
+            fail_count += result.1;
+            errors.extend(result.2);
+        }
+    }
+
+    (success_count, fail_count, errors)
 }
 
 #[tauri::command]
@@ -215,6 +274,56 @@ fn get_thumbnail_path(
     state.db.get_thumbnail_path(file_id).map_err(|e| e.to_string())
 }
 
+#[derive(serde::Serialize)]
+struct DirEntry {
+    name: String,
+    path: String,
+    is_dir: bool,
+    size: u64,
+}
+
+#[tauri::command]
+fn list_dir(dir_path: String) -> Result<Vec<DirEntry>, String> {
+    let path = Path::new(&dir_path);
+    if !path.exists() {
+        return Err("路径不存在".to_string());
+    }
+    if !path.is_dir() {
+        return Err("不是目录".to_string());
+    }
+
+    let mut entries = Vec::new();
+    let dir_entries = std::fs::read_dir(path).map_err(|e| e.to_string())?;
+
+    for entry in dir_entries {
+        if let Ok(entry) = entry {
+            let metadata = entry.metadata().ok();
+            let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+            let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+            let name = entry.file_name().to_string_lossy().to_string();
+            let path = entry.path().to_string_lossy().to_string();
+
+            entries.push(DirEntry {
+                name,
+                path,
+                is_dir,
+                size,
+            });
+        }
+    }
+
+    // Sort: folders first, then files, both alphabetically
+    entries.sort_by(|a, b| {
+        match (a.is_dir, b.is_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        }
+    });
+
+    Ok(entries)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -266,6 +375,7 @@ pub fn run() {
             move_file,
             search_files,
             get_thumbnail_path,
+            list_dir,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

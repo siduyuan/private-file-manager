@@ -152,7 +152,7 @@ function App() {
     }
   };
 
-  const handleImport = async () => {
+  const handleImportFiles = async () => {
     try {
       const selected = await open({
         multiple: true,
@@ -170,32 +170,41 @@ function App() {
           message.success(`成功导入 ${result.success_count} 个文件`);
         }
         loadFiles(currentFolderId);
+        loadFolders();
       }
     } catch (e) {
       message.error('导入失败: ' + e);
     }
   };
 
-  const handleImportFolder = async () => {
+  const handleImportFolders = async () => {
     try {
       const selected = await open({
-        multiple: false,
+        multiple: true,
         directory: true,
       });
       if (selected) {
         const paths = Array.isArray(selected) ? selected : [selected];
+        console.log('Importing folders:', paths);
         const result = await invoke<ImportResult>('import_files', {
           filePaths: paths,
           folderId: currentFolderId,
         });
+        console.log('Import result:', result);
         if (result.fail_count > 0) {
           message.warning(`导入完成：成功 ${result.success_count} 个，失败 ${result.fail_count} 个`);
+          if (result.errors.length > 0) {
+            console.error('Import errors:', result.errors);
+          }
         } else {
-          message.success(`成功导入 ${result.success_count} 个文件`);
+          message.success(`成功导入 ${result.success_count} 个文件，请查看左侧目录树`);
         }
-        loadFiles(currentFolderId);
+        // Refresh both files and folders
+        await loadFolders();
+        await loadFiles(currentFolderId);
       }
     } catch (e) {
+      console.error('Import failed:', e);
       message.error('导入失败: ' + e);
     }
   };
@@ -223,13 +232,14 @@ function App() {
     }
   };
 
-  const handleDelete = async () => {
-    if (selectedFileIds.length === 0) return;
+  const handleDelete = async (ids?: number[]) => {
+    const targetIds = ids || selectedFileIds;
+    if (targetIds.length === 0) return;
     try {
-      for (const id of selectedFileIds) {
+      for (const id of targetIds) {
         await invoke('delete_file', { fileId: id });
       }
-      message.success(`已删除 ${selectedFileIds.length} 个文件`);
+      message.success(`已删除 ${targetIds.length} 个文件`);
       setSelectedFileIds([]);
       loadFiles(currentFolderId);
     } catch (e) {
@@ -314,11 +324,10 @@ function App() {
       icon: <DeleteOutlined />,
       danger: true,
       onClick: () => {
-        setSelectedFileIds([file.file_id]);
         Modal.confirm({
           title: '确认删除',
           content: `确定要删除 "${file.name}" 吗？`,
-          onOk: handleDelete,
+          onOk: () => handleDelete([file.file_id]),
         });
       },
     },
@@ -382,16 +391,16 @@ function App() {
       <Layout.Header style={{ background: '#fff', padding: '0 16px', borderBottom: '1px solid #f0f0f0', display: 'flex', alignItems: 'center', justifyContent: 'space-between', height: 48 }}>
         <Space>
           <Tooltip title="导入文件">
-            <Button icon={<ImportOutlined />} onClick={handleImport}>导入文件</Button>
+            <Button icon={<ImportOutlined />} onClick={handleImportFiles}>导入文件</Button>
           </Tooltip>
           <Tooltip title="导入文件夹">
-            <Button icon={<FolderAddOutlined />} onClick={handleImportFolder}>导入文件夹</Button>
+            <Button icon={<FolderAddOutlined />} onClick={handleImportFolders}>导入文件夹</Button>
           </Tooltip>
           <Tooltip title="导出选中">
             <Button icon={<ExportOutlined />} onClick={handleExport} disabled={selectedFileIds.length === 0}>导出</Button>
           </Tooltip>
           <Tooltip title="删除选中">
-            <Button icon={<DeleteOutlined />} onClick={handleDelete} danger disabled={selectedFileIds.length === 0}>删除</Button>
+            <Button icon={<DeleteOutlined />} onClick={() => handleDelete()} danger disabled={selectedFileIds.length === 0}>删除</Button>
           </Tooltip>
           <Tooltip title="新建文件夹">
             <Button icon={<FolderAddOutlined />} onClick={() => setNewFolderModalOpen(true)}>新建文件夹</Button>
