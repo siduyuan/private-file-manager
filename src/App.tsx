@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback } from 'react';
-import { Layout, Tree, Table, Button, Input, Space, Breadcrumb, Dropdown, message, Modal, Tooltip } from 'antd';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { Layout, Tree, Table, Button, Input, Space, Breadcrumb, Dropdown, message, Modal, Tooltip, Menu } from 'antd';
 import {
   FolderOutlined,
   FolderOpenOutlined,
@@ -191,6 +191,30 @@ function App() {
   const [expandedKeys, setExpandedKeys] = useState<React.Key[]>([1]); // 默认展开根目录
   const [currentFolders, setCurrentFolders] = useState<FolderInfo[]>([]); // 当前目录下的子文件夹
 
+  // 单击停顿再单击 = 重命名（用 ref 避免闭包陈旧值问题）
+  const lastClickTimeRef = useRef<number>(0);
+  const lastClickIdRef = useRef<number | null>(null);
+  const [inlineRenameId, setInlineRenameId] = useState<number | null>(null); // 正数=file_id, 负数=-folder_id
+  const [inlineRenameValue, setInlineRenameValue] = useState('');
+
+  // 拖拽选择框（用 ref 存储起始点，避免闭包陈旧值）
+  const [isSelecting, setIsSelecting] = useState(false);
+  const [selectionRect, setSelectionRect] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const selectStartRef = useRef<{ x: number; y: number } | null>(null);
+  const justFinishedSelectionRef = useRef<boolean>(false); // 标记是否刚完成框选
+
+  // 自定义拖拽移动（替代 HTML5 拖拽 API，解决 WebView2 兼容性问题）
+  const [isCustomDragging, setIsCustomDragging] = useState(false);
+  const [customDragMouse, setCustomDragMouse] = useState<{ x: number; y: number } | null>(null);
+  const [sidebarHoverFolderId, setSidebarHoverFolderId] = useState<number | null>(null);
+  const mouseDownInfoRef = useRef<{ x: number; y: number; target: HTMLElement; isGridItem: boolean; isFileRow: boolean } | null>(null);
+  const customDragIdsRef = useRef<number[]>([]);
+
+  // 右键菜单
+  const [contextMenuRecord, setContextMenuRecord] = useState<any>(null);
+  const [contextMenuPos, setContextMenuPos] = useState<{ x: number; y: number } | null>(null);
+
   const loadFolders = useCallback(async () => {
     try {
       const result = await invoke<FolderInfo[]>('get_folders');
@@ -221,6 +245,74 @@ function App() {
     loadFiles(currentFolderId);
   }, [currentFolderId, loadFolders, loadFiles]);
 
+  // 全局鼠标事件监听，确保拖拽和选择框在鼠标移出内容区域后仍能工作
+  useEffect(() => {
+    const handleGlobalMouseMove = (e: MouseEvent) => {
+      if (isCustomDragging) {
+        setCustomDragMouse({ x: e.clientX, y: e.clientY });
+        // 检测鼠标是否悬停在侧边栏的文件夹上
+        const treeNodes = document.querySelectorAll('.ant-tree-treenode');
+        let foundFolderId: number | null = null;
+        treeNodes.forEach(node => {
+          const rect = node.getBoundingClientRect();
+          if (e.clientX >= rect.left && e.clientX <= rect.right &&
+              e.clientY >= rect.top && e.clientY <= rect.bottom) {
+            // 通过 data-folder-id 属性精确匹配文件夹
+            const folderIdAttr = node.getAttribute('data-folder-id') || 
+                                 node.querySelector('[data-folder-id]')?.getAttribute('data-folder-id');
+            if (folderIdAttr) {
+              foundFolderId = parseInt(folderIdAttr);
+            }
+          }
+        });
+        setSidebarHoverFolderId(foundFolderId);
+      }
+    };
+
+    const handleGlobalMouseUp = () => {
+      if (isCustomDragging) {
+        if (sidebarHoverFolderId !== null) {
+          const ids = customDragIdsRef.current;
+          let successCount = 0;
+          ids.forEach(id => {
+            if (id > 0) {
+              invoke('move_file', { fileId: id, targetFolderId: sidebarHoverFolderId })
+                .then(() => { successCount++; })
+                .catch(err => message.error('移动失败: ' + err));
+            } else {
+              const folderId = -id;
+              if (folderId !== sidebarHoverFolderId) {
+                invoke('move_folder', { folderId, targetParentId: sidebarHoverFolderId })
+                  .then(() => { successCount++; })
+                  .catch(err => message.error('移动失败: ' + err));
+              }
+            }
+          });
+          if (successCount > 0) {
+            setTimeout(() => {
+              message.success(`成功移动 ${successCount} 个项目`);
+              loadFiles(currentFolderId);
+              loadFolders();
+            }, 100);
+          }
+        }
+        setIsCustomDragging(false);
+        setCustomDragMouse(null);
+        setSidebarHoverFolderId(null);
+        customDragIdsRef.current = [];
+        mouseDownInfoRef.current = null;
+      }
+    };
+
+    window.addEventListener('mousemove', handleGlobalMouseMove);
+    window.addEventListener('mouseup', handleGlobalMouseUp);
+
+    return () => {
+      window.removeEventListener('mousemove', handleGlobalMouseMove);
+      window.removeEventListener('mouseup', handleGlobalMouseUp);
+    };
+  }, [isCustomDragging, sidebarHoverFolderId, folders, currentFolderId]);
+
   // Build tree data from folders
   const buildTreeData = (folders: FolderInfo[]): DataNode[] => {
     const folderMap = new Map<number, FolderInfo[]>();
@@ -237,6 +329,8 @@ function App() {
         title: f.name,
         icon: currentFolderId === f.folder_id ? <FolderOpenOutlined /> : <FolderOutlined />,
         children: buildNode(f.folder_id),
+        // 添加自定义属性用于拖拽检测
+        'data-folder-id': f.folder_id,
       }));
     };
 
@@ -326,7 +420,7 @@ function App() {
 
   const handleExport = async () => {
     if (selectedFileIds.length === 0) {
-      message.warning('请先选择要导出的文件');
+      message.warning('请先选择要导出的文件或文件夹');
       return;
     }
     try {
@@ -336,11 +430,19 @@ function App() {
       });
       if (targetDir) {
         const dir = Array.isArray(targetDir) ? targetDir[0] : targetDir;
+        // 区分文件和文件夹
+        const folderIds = currentFolders
+          .filter(f => selectedFileIds.includes(f.folder_id))
+          .map(f => f.folder_id);
+        const fileIds = selectedFileIds.filter(id => !folderIds.includes(id));
+        
         await invoke<string[]>('export_files', {
-          fileIds: selectedFileIds,
+          fileIds: fileIds,
+          folderIds: folderIds,
           targetDir: dir,
         });
-        message.success(`成功导出 ${selectedFileIds.length} 个文件`);
+        const totalCount = fileIds.length + folderIds.length;
+        message.success(`成功导出 ${totalCount} 个项目`);
       }
     } catch (e) {
       message.error('导出失败: ' + e);
@@ -431,47 +533,314 @@ function App() {
     }
   };
 
-  const getContextMenuItems = (file: FileInfo): MenuProps['items'] => [
-    {
-      key: 'open',
-      label: '打开',
-      onClick: () => handleOpenFile(file.file_id),
-    },
-    { type: 'divider' },
-    {
-      key: 'rename',
-      label: '重命名',
-      icon: <EditOutlined />,
-      onClick: () => {
-        setRenameFileId(file.file_id);
-        setRenameValue(file.name);
-        setRenameModalOpen(true);
-      },
-    },
-    {
-      key: 'delete',
-      label: '删除',
-      icon: <DeleteOutlined />,
-      danger: true,
-      onClick: () => {
-        Modal.confirm({
-          title: '确认删除',
-          content: `确定要删除 "${file.name}" 吗？`,
-          onOk: () => handleDelete([file.file_id]),
+  // 单击停顿再单击 = 重命名（Windows风格）
+  const handleClickForRename = (id: number, name: string) => {
+    const now = Date.now();
+    const lastTime = lastClickTimeRef.current;
+    const lastId = lastClickIdRef.current;
+    const elapsed = now - lastTime;
+    
+    if (lastId === id && elapsed >= 300 && elapsed < 1500) {
+      // 停顿后再点击，进入重命名模式
+      setInlineRenameId(id);
+      setInlineRenameValue(name);
+      lastClickIdRef.current = null;
+      lastClickTimeRef.current = 0;
+    } else if (lastId === id && elapsed < 300) {
+      // 双击，不重置 lastClickTime，保持原值
+    } else {
+      // 首次点击或点击了不同项目
+      lastClickIdRef.current = id;
+      lastClickTimeRef.current = now;
+    }
+  };
+
+  // 提交行内重命名
+  const handleInlineRenameSubmit = async () => {
+    if (inlineRenameId === null || !inlineRenameValue.trim()) {
+      setInlineRenameId(null);
+      return;
+    }
+    try {
+      if (inlineRenameId > 0) {
+        // 文件重命名
+        await invoke('rename_file', { fileId: inlineRenameId, newName: inlineRenameValue });
+      } else {
+        // 文件夹重命名
+        await invoke('rename_folder', { folderId: -inlineRenameId, newName: inlineRenameValue });
+      }
+      message.success('重命名成功');
+      loadFiles(currentFolderId);
+      loadFolders();
+    } catch (e) {
+      message.error('重命名失败: ' + e);
+    }
+    setInlineRenameId(null);
+  };
+
+  // 统一鼠标事件处理：选择框 + 自定义拖拽
+  const handleMouseDown = (e: React.MouseEvent) => {
+    if (e.button !== 0) return;
+    const target = e.target as HTMLElement;
+    const gridItem = target.closest('.grid-item') as HTMLElement;
+    const fileRow = target.closest('.file-row') as HTMLElement;
+
+    if (gridItem) {
+      // 点击了图标视图的项目
+      const id = parseInt(gridItem.getAttribute('data-id') || '0');
+      // 如果点击的是已选中项目，准备可能的拖拽
+      if (selectedFileIds.includes(id)) {
+        mouseDownInfoRef.current = { x: e.clientX, y: e.clientY, target: gridItem, isGridItem: true, isFileRow: false };
+        customDragIdsRef.current = selectedFileIds.map(sid => {
+          const f = currentFolders.find(cf => cf.folder_id === sid);
+          return f ? -sid : sid;
         });
+      }
+    } else if (fileRow) {
+      // 点击了列表视图的行
+      const id = parseInt(fileRow.getAttribute('data-id') || '0');
+      if (selectedFileIds.includes(id)) {
+        mouseDownInfoRef.current = { x: e.clientX, y: e.clientY, target: fileRow, isGridItem: false, isFileRow: true };
+        customDragIdsRef.current = selectedFileIds.map(sid => {
+          const f = currentFolders.find(cf => cf.folder_id === sid);
+          return f ? -sid : sid;
+        });
+      }
+    } else {
+      // 点击了空白区域，准备选择框
+      const rect = contentRef.current?.getBoundingClientRect();
+      if (!rect || !contentRef.current) return;
+      const startX = e.clientX - rect.left + contentRef.current.scrollLeft;
+      const startY = e.clientY - rect.top + contentRef.current.scrollTop;
+      selectStartRef.current = { x: startX, y: startY };
+      mouseDownInfoRef.current = { x: e.clientX, y: e.clientY, target, isGridItem: false, isFileRow: false };
+      setIsSelecting(true);
+      setSelectionRect({ x: startX, y: startY, w: 0, h: 0 });
+    }
+  };
+
+  const handleMouseMove = (e: React.MouseEvent) => {
+    const info = mouseDownInfoRef.current;
+    if (!info) return;
+
+    // 如果还没确定是拖拽还是选择框
+    if (!isCustomDragging && !isSelecting) {
+      const dist = Math.sqrt((e.clientX - info.x) ** 2 + (e.clientY - info.y) ** 2);
+      if (dist < 5) return; // 移动距离太小，忽略
+
+      if (info.isGridItem || info.isFileRow) {
+        // 开始拖拽已选中的项目
+        setIsCustomDragging(true);
+        setCustomDragMouse({ x: e.clientX, y: e.clientY });
+        return;
+      } else {
+        // 开始选择框
+        const rect = contentRef.current?.getBoundingClientRect();
+        if (!rect || !contentRef.current) return;
+        const startX = info.x - rect.left + contentRef.current.scrollLeft;
+        const startY = info.y - rect.top + contentRef.current.scrollTop;
+        selectStartRef.current = { x: startX, y: startY };
+        setIsSelecting(true);
+        setSelectionRect({ x: startX, y: startY, w: 0, h: 0 });
+      }
+    }
+
+    // 处理自定义拖拽
+    if (isCustomDragging) {
+      setCustomDragMouse({ x: e.clientX, y: e.clientY });
+      // 检测鼠标是否悬停在侧边栏的文件夹上
+      const treeNodes = document.querySelectorAll('.ant-tree-treenode');
+      let foundFolderId: number | null = null;
+      treeNodes.forEach(node => {
+        const rect = node.getBoundingClientRect();
+        if (e.clientX >= rect.left && e.clientX <= rect.right &&
+            e.clientY >= rect.top && e.clientY <= rect.bottom) {
+          const titleEl = node.querySelector('.ant-tree-title');
+          if (titleEl) {
+            const name = titleEl.textContent || '';
+            const folder = folders.find(f => f.name === name);
+            if (folder) foundFolderId = folder.folder_id;
+          }
+        }
+      });
+      setSidebarHoverFolderId(foundFolderId);
+      return;
+    }
+
+    // 处理选择框
+    if (isSelecting && contentRef.current && selectStartRef.current) {
+      const rect = contentRef.current.getBoundingClientRect();
+      const startX = selectStartRef.current.x;
+      const startY = selectStartRef.current.y;
+      const curX = e.clientX - rect.left + contentRef.current.scrollLeft;
+      const curY = e.clientY - rect.top + contentRef.current.scrollTop;
+
+      const x = Math.min(startX, curX);
+      const y = Math.min(startY, curY);
+      const w = Math.abs(curX - startX);
+      const h = Math.abs(curY - startY);
+
+      setSelectionRect({ x, y, w, h });
+
+      // 检测哪些项目在选择框内
+      const items = contentRef.current.querySelectorAll('.grid-item, .file-row');
+      const selectedIds: number[] = [];
+      items.forEach((item) => {
+        const itemRect = item.getBoundingClientRect();
+        const itemLeft = itemRect.left - rect.left + contentRef.current!.scrollLeft;
+        const itemTop = itemRect.top - rect.top + contentRef.current!.scrollTop;
+        const itemRight = itemLeft + itemRect.width;
+        const itemBottom = itemTop + itemRect.height;
+        if (itemLeft < x + w && itemRight > x && itemTop < y + h && itemBottom > y) {
+          const id = parseInt(item.getAttribute('data-id') || '0');
+          const type = item.getAttribute('data-type');
+          if (type === 'folder') selectedIds.push(-id);
+          else selectedIds.push(id);
+        }
+      });
+      setSelectedFileIds(selectedIds.map(id => Math.abs(id)));
+    }
+  };
+
+  const handleMouseUp = () => {
+    // 完成自定义拖拽
+    if (isCustomDragging) {
+      if (sidebarHoverFolderId !== null) {
+        const ids = customDragIdsRef.current;
+        let successCount = 0;
+        ids.forEach(id => {
+          if (id > 0) {
+            invoke('move_file', { fileId: id, targetFolderId: sidebarHoverFolderId })
+              .then(() => { successCount++; })
+              .catch(err => message.error('移动失败: ' + err));
+          } else {
+            const folderId = -id;
+            if (folderId !== sidebarHoverFolderId) {
+              invoke('move_folder', { folderId, targetParentId: sidebarHoverFolderId })
+                .then(() => { successCount++; })
+                .catch(err => message.error('移动失败: ' + err));
+            }
+          }
+        });
+        if (successCount > 0) {
+          setTimeout(() => {
+            message.success(`成功移动 ${successCount} 个项目`);
+            loadFiles(currentFolderId);
+            loadFolders();
+          }, 100);
+        }
+      }
+      setIsCustomDragging(false);
+      setCustomDragMouse(null);
+      setSidebarHoverFolderId(null);
+      customDragIdsRef.current = [];
+      mouseDownInfoRef.current = null;
+      return;
+    }
+
+    // 完成选择框
+    if (isSelecting) {
+      setIsSelecting(false);
+      setSelectionRect(null);
+      selectStartRef.current = null;
+      justFinishedSelectionRef.current = true;
+      setTimeout(() => {
+        justFinishedSelectionRef.current = false;
+      }, 100);
+    }
+    mouseDownInfoRef.current = null;
+  };
+
+  const getContextMenuItems = (record: any): MenuProps['items'] => {
+    const isFolder = record.category === 'folder' || record.isFolder;
+    
+    if (isFolder) {
+      // 文件夹的右键菜单
+      return [
+        {
+          key: 'open',
+          label: '打开文件夹',
+          onClick: () => enterFolder(record.file_id),
+        },
+        { type: 'divider' },
+        {
+          key: 'rename',
+          label: '重命名',
+          icon: <EditOutlined />,
+          onClick: () => {
+            setInlineRenameId(-record.file_id);
+            setInlineRenameValue(record.name);
+          },
+        },
+        {
+          key: 'delete',
+          label: '删除',
+          icon: <DeleteOutlined />,
+          danger: true,
+          onClick: () => {
+            Modal.confirm({
+              title: '确认删除',
+              content: `确定要删除文件夹 "${record.name}" 及其所有内容吗？`,
+              onOk: () => handleDelete([record.file_id]),
+            });
+          },
+        },
+        { type: 'divider' },
+        {
+          key: 'export',
+          label: '导出到...',
+          icon: <ExportOutlined />,
+          onClick: () => {
+            setSelectedFileIds([record.file_id]);
+            handleExport();
+          },
+        },
+      ];
+    }
+    
+    // 文件的右键菜单
+    return [
+      {
+        key: 'open',
+        label: '打开',
+        onClick: () => handleOpenFile(record.file_id),
       },
-    },
-    { type: 'divider' },
-    {
-      key: 'export',
-      label: '导出到...',
-      icon: <ExportOutlined />,
-      onClick: () => {
-        setSelectedFileIds([file.file_id]);
-        handleExport();
+      { type: 'divider' },
+      {
+        key: 'rename',
+        label: '重命名',
+        icon: <EditOutlined />,
+        onClick: () => {
+          setRenameFileId(record.file_id);
+          setRenameValue(record.name);
+          setRenameModalOpen(true);
+        },
       },
-    },
-  ];
+      {
+        key: 'delete',
+        label: '删除',
+        icon: <DeleteOutlined />,
+        danger: true,
+        onClick: () => {
+          Modal.confirm({
+            title: '确认删除',
+            content: `确定要删除 "${record.name}" 吗？`,
+            onOk: () => handleDelete([record.file_id]),
+          });
+        },
+      },
+      { type: 'divider' },
+      {
+        key: 'export',
+        label: '导出到...',
+        icon: <ExportOutlined />,
+        onClick: () => {
+          setSelectedFileIds([record.file_id]);
+          handleExport();
+        },
+      },
+    ];
+  };
 
   return (
     <Layout style={{ height: '100vh' }}>
@@ -515,7 +884,10 @@ function App() {
 
       <Layout style={{ flex: 1, overflow: 'hidden' }}>
         {/* Sidebar - Directory Tree */}
-        <Layout.Sider width={240} style={{ background: '#fff', borderRight: '1px solid #f0f0f0', overflow: 'auto' }}>
+        <Layout.Sider 
+          width={180} 
+          style={{ background: '#fff', borderRight: '1px solid #f0f0f0', overflow: 'auto' }}
+        >
           <div style={{ padding: '8px 12px', fontWeight: 'bold', borderBottom: '1px solid #f0f0f0' }}>
             <HomeOutlined /> 目录
           </div>
@@ -553,8 +925,18 @@ function App() {
           {/* File List / Grid */}
           {viewMode === 'list' ? (
             <div
+              ref={contentRef}
               tabIndex={0}
-              onClick={() => setSelectedFileIds([])}
+              onMouseDown={handleMouseDown}
+              onMouseMove={handleMouseMove}
+              onMouseUp={handleMouseUp}
+              onClick={() => {
+                if (justFinishedSelectionRef.current) return;
+                setSelectedFileIds([]);
+                setInlineRenameId(null);
+                setContextMenuRecord(null);
+                setContextMenuPos(null);
+              }}
               onKeyDown={(e) => {
                 if (e.ctrlKey && e.key === 'a') {
                   e.preventDefault();
@@ -565,7 +947,7 @@ function App() {
                   setSelectedFileIds(allIds);
                 }
               }}
-              style={{ outline: 'none', height: '100%', overflow: 'auto', cursor: 'default' }}
+              style={{ outline: 'none', height: '100%', overflow: 'auto', cursor: 'default', position: 'relative' }}
             >
               <Table
                 dataSource={[
@@ -581,6 +963,12 @@ function App() {
                   ...files.map(f => ({ ...f, isFolder: false })),
                 ]}
                 columns={[
+                  {
+                    title: '',
+                    key: 'spacer',
+                    width: 8,
+                    render: () => <span style={{ width: 8, display: 'inline-block' }} />,
+                  },
                   {
                     title: '文件名',
                     dataIndex: 'name',
@@ -639,6 +1027,21 @@ function App() {
                 size="small"
                 rowClassName={(record: any) => selectedFileIds.includes(record.file_id) ? 'file-row file-row-selected' : 'file-row'}
                 onRow={(record: any) => ({
+                  'data-id': record.file_id,
+                  'data-type': record.isFolder ? 'folder' : 'file',
+                  onMouseDown: (e: React.MouseEvent) => {
+                    // 如果点击的是已选中的行，准备拖拽
+                    if (selectedFileIds.includes(record.file_id)) {
+                      const row = (e.target as HTMLElement).closest('.file-row') as HTMLElement;
+                      if (row) {
+                        mouseDownInfoRef.current = { x: e.clientX, y: e.clientY, target: row, isGridItem: false, isFileRow: true };
+                        customDragIdsRef.current = selectedFileIds.map(sid => {
+                          const f = currentFolders.find(cf => cf.folder_id === sid);
+                          return f ? -sid : sid;
+                        });
+                      }
+                    }
+                  },
                   onClick: (e) => {
                     e.stopPropagation();
                     if (e.ctrlKey) {
@@ -660,13 +1063,34 @@ function App() {
                   },
                   onContextMenu: (e) => {
                     e.preventDefault();
+                    e.stopPropagation();
+                    // 设置右键菜单
+                    setContextMenuRecord(record);
+                    setContextMenuPos({ x: e.clientX, y: e.clientY });
                   },
                 })}
                 scroll={{ y: 'calc(100vh - 180px)' }}
               />
+              {/* 列表视图选择框 */}
+              {selectionRect && selectionRect.w > 2 && selectionRect.h > 2 && (
+                <div
+                  style={{
+                    position: 'absolute',
+                    left: selectionRect.x,
+                    top: selectionRect.y,
+                    width: selectionRect.w,
+                    height: selectionRect.h,
+                    border: '1px solid #1890ff',
+                    background: 'rgba(24, 144, 255, 0.1)',
+                    pointerEvents: 'none',
+                    zIndex: 1000,
+                  }}
+                />
+              )}
             </div>
           ) : (
             <div
+              ref={contentRef}
               tabIndex={0}
               onKeyDown={(e) => {
                 // Ctrl+A 全选
@@ -679,14 +1103,43 @@ function App() {
                   setSelectedFileIds(allIds);
                 }
               }}
-              style={{ padding: 16, display: 'flex', flexWrap: 'wrap', gap: 12, overflow: 'auto', outline: 'none', cursor: 'default' }}
-              onClick={() => setSelectedFileIds([])}
+              onMouseDown={handleMouseDown}
+              onMouseMove={handleMouseMove}
+              onMouseUp={handleMouseUp}
+              style={{ padding: 16, display: 'flex', flexWrap: 'wrap', gap: 12, overflow: 'auto', outline: 'none', cursor: 'default', position: 'relative', minHeight: 'calc(100vh - 180px)', alignContent: 'flex-start' }}
+              onClick={() => {
+                // 如果刚完成框选，不清空选中状态
+                if (justFinishedSelectionRef.current) return;
+                setSelectedFileIds([]);
+                setInlineRenameId(null);
+                setContextMenuRecord(null);
+                setContextMenuPos(null);
+              }}
             >
               {/* 文件夹 */}
               {currentFolders.map(folder => (
-                <div
+                <Dropdown
                   key={`folder-${folder.folder_id}`}
+                  menu={{ items: getContextMenuItems({
+                    file_id: folder.folder_id,
+                    name: folder.name,
+                    category: 'folder',
+                    size_bytes: 0,
+                    ext: null,
+                    mime_type: null,
+                    duration_sec: null,
+                    width: null,
+                    height: null,
+                    thumbnail_path: null,
+                    created_at: folder.created_at,
+                    updated_at: folder.created_at,
+                  } as FileInfo) }}
+                  trigger={['contextMenu']}
+                >
+                <div
                   className={`grid-item ${selectedFileIds.includes(folder.folder_id) ? 'grid-item-selected' : ''}`}
+                  data-id={folder.folder_id}
+                  data-type="folder"
                   style={{
                     width: 120,
                     padding: 8,
@@ -704,9 +1157,10 @@ function App() {
                       );
                     } else {
                       setSelectedFileIds([folder.folder_id]);
+                      handleClickForRename(-folder.folder_id, folder.name);
                     }
                   }}
-                  onDoubleClick={() => enterFolder(folder.folder_id)}
+                  onDoubleClick={() => { setInlineRenameId(null); enterFolder(folder.folder_id); }}
                 >
                   <div style={{ fontSize: 40, marginBottom: 4 }}>
                     <FolderOutlined style={{ color: '#faad14' }} />
@@ -717,12 +1171,25 @@ function App() {
                     textOverflow: 'ellipsis',
                     whiteSpace: 'nowrap',
                   }}>
-                    {folder.name}
+                    {inlineRenameId === -folder.folder_id ? (
+                      <Input
+                        size="small"
+                        value={inlineRenameValue}
+                        onChange={e => setInlineRenameValue(e.target.value)}
+                        onBlur={handleInlineRenameSubmit}
+                        onPressEnter={handleInlineRenameSubmit}
+                        onKeyDown={e => { if (e.key === 'Escape') setInlineRenameId(null); }}
+                        autoFocus
+                        onClick={e => e.stopPropagation()}
+                        style={{ fontSize: 12, padding: '0 4px' }}
+                      />
+                    ) : folder.name}
                   </div>
                   <div style={{ fontSize: 11, color: '#999' }}>
                     文件夹
                   </div>
                 </div>
+                </Dropdown>
               ))}
               {/* 文件 */}
               {files.map(file => (
@@ -733,6 +1200,8 @@ function App() {
                 >
                   <div
                     className={`grid-item ${selectedFileIds.includes(file.file_id) ? 'grid-item-selected' : ''}`}
+                    data-id={file.file_id}
+                    data-type="file"
                     style={{
                       width: 120,
                       padding: 8,
@@ -740,7 +1209,7 @@ function App() {
                       borderRadius: 4,
                       border: selectedFileIds.includes(file.file_id) ? '2px solid #1890ff' : '1px solid #f0f0f0',
                     }}
-                    onDoubleClick={() => handleOpenFile(file.file_id)}
+                    onDoubleClick={() => { setInlineRenameId(null); handleOpenFile(file.file_id); }}
                     onClick={(e) => {
                       e.stopPropagation();
                       if (e.ctrlKey) {
@@ -751,6 +1220,7 @@ function App() {
                         );
                       } else {
                         setSelectedFileIds([file.file_id]);
+                        handleClickForRename(file.file_id, file.name);
                       }
                     }}
                   >
@@ -773,7 +1243,19 @@ function App() {
                       textOverflow: 'ellipsis',
                       whiteSpace: 'nowrap',
                     }}>
-                      {file.name}
+                      {inlineRenameId === file.file_id ? (
+                        <Input
+                          size="small"
+                          value={inlineRenameValue}
+                          onChange={e => setInlineRenameValue(e.target.value)}
+                          onBlur={handleInlineRenameSubmit}
+                          onPressEnter={handleInlineRenameSubmit}
+                          onKeyDown={e => { if (e.key === 'Escape') setInlineRenameId(null); }}
+                          autoFocus
+                          onClick={e => e.stopPropagation()}
+                          style={{ fontSize: 12, padding: '0 4px' }}
+                        />
+                      ) : file.name}
                     </div>
                     <div style={{ fontSize: 11, color: '#999' }}>
                       {formatFileSize(file.size_bytes)}
@@ -781,10 +1263,67 @@ function App() {
                   </div>
                 </Dropdown>
               ))}
+              {/* 拖拽选择框 */}
+              {selectionRect && selectionRect.w > 2 && selectionRect.h > 2 && (
+                <div
+                  style={{
+                    position: 'absolute',
+                    left: selectionRect.x,
+                    top: selectionRect.y,
+                    width: selectionRect.w,
+                    height: selectionRect.h,
+                    border: '1px solid #1890ff',
+                    background: 'rgba(24, 144, 255, 0.1)',
+                    pointerEvents: 'none',
+                    zIndex: 1000,
+                  }}
+                />
+              )}
             </div>
           )}
         </Layout.Content>
       </Layout>
+
+      {/* 自定义拖拽覆盖层 */}
+      {isCustomDragging && customDragMouse && (
+        <>
+          <div
+            style={{
+              position: 'fixed',
+              left: customDragMouse.x + 12,
+              top: customDragMouse.y + 12,
+              background: '#fff',
+              border: '1px solid #1890ff',
+              borderRadius: 4,
+              padding: '4px 8px',
+              fontSize: 12,
+              boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
+              pointerEvents: 'none',
+              zIndex: 10000,
+            }}
+          >
+            移动 {customDragIdsRef.current.length} 个项目
+          </div>
+          {sidebarHoverFolderId !== null && (
+            <div
+              style={{
+                position: 'fixed',
+                left: customDragMouse.x + 12,
+                top: customDragMouse.y + 36,
+                background: '#e6f7ff',
+                border: '1px solid #1890ff',
+                borderRadius: 4,
+                padding: '2px 6px',
+                fontSize: 11,
+                pointerEvents: 'none',
+                zIndex: 10000,
+              }}
+            >
+              释放以移动到: {folders.find(f => f.folder_id === sidebarHoverFolderId)?.name}
+            </div>
+          )}
+        </>
+      )}
 
       {/* Status Bar */}
       <Layout.Footer style={{ height: 28, padding: '0 16px', background: '#fafafa', borderTop: '1px solid #f0f0f0', display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 12, color: '#666', lineHeight: '28px' }}>
@@ -823,6 +1362,55 @@ function App() {
           onPressEnter={handleCreateFolder}
         />
       </Modal>
+
+      {/* 全局右键菜单（用于列表视图） */}
+      {contextMenuRecord && contextMenuPos && (
+        <>
+          {/* 全屏遮罩层，用于捕获点击事件以关闭菜单 */}
+          <div
+            style={{
+              position: 'fixed',
+              top: 0,
+              left: 0,
+              right: 0,
+              bottom: 0,
+              zIndex: 9999,
+            }}
+            onClick={() => {
+              setContextMenuRecord(null);
+              setContextMenuPos(null);
+            }}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              setContextMenuRecord(null);
+              setContextMenuPos(null);
+            }}
+          />
+          {/* 右键菜单 */}
+          <div
+            style={{
+              position: 'fixed',
+              left: contextMenuPos.x,
+              top: contextMenuPos.y,
+              zIndex: 10000,
+              background: '#fff',
+              border: '1px solid #d9d9d9',
+              borderRadius: 4,
+              boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
+              padding: '4px 0',
+            }}
+          >
+            <Menu
+              items={getContextMenuItems(contextMenuRecord)}
+              onClick={() => {
+                setContextMenuRecord(null);
+                setContextMenuPos(null);
+              }}
+              style={{ border: 'none' }}
+            />
+          </div>
+        </>
+      )}
     </Layout>
   );
 }

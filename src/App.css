@@ -37,14 +37,11 @@ body {
   background-color: #e6f7ff !important;
 }
 
-.file-row-selected,
+/* 选中行的样式优先级最高 */
+.ant-table-tbody > tr.file-row-selected > td,
+.ant-table-tbody > tr.file-row-selected:hover > td,
 .file-row-selected > td {
   background-color: #bae7ff !important;
-}
-
-.file-row-selected:hover,
-.file-row-selected:hover > td {
-  background-color: #91d5ff !important;
 }
 
 /* Grid view items */
@@ -52,6 +49,21 @@ body {
   cursor: pointer;
   user-select: none;
   transition: background-color 0.2s;
+  flex-shrink: 0;
+}
+
+/* 拖拽时禁止默认禁止光标 */
+.grid-item[draggable="true"] {
+  cursor: grab;
+}
+.grid-item[draggable="true"]:active {
+  cursor: grabbing;
+}
+
+/* 目录树拖拽悬停时的视觉反馈 */
+.ant-tree-treenode.drag-over > .ant-tree-node-content-wrapper {
+  background-color: #bae7ff !important;
+  outline: 2px dashed #1890ff;
 }
 
 .grid-item:hover {

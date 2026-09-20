@@ -100,34 +100,53 @@ pub fn import_file(
     while remaining > 0 {
         let current_chunk_size = std::cmp::min(chunk_size, remaining);
 
-        // Get or create store file
-        let store_file_name = db
-            .get_or_create_store_file(MAX_STORE_FILE_SIZE)
-            .map_err(|e| format!("DB store file error: {}", e))?;
-
-        let store_path = store_dir.join(&store_file_name);
-
-        // Get current offset in store file
-        let current_offset = {
-            let sf = fs::metadata(&store_path)
-                .map(|m| m.len())
-                .unwrap_or(0);
-            sf
-        };
-
         // Read chunk from source
         let mut buffer = vec![0u8; current_chunk_size as usize];
         source_file
             .read_exact(&mut buffer)
             .map_err(|e| format!("Read error: {}", e))?;
 
+        // Try to reuse free space first
+        let (store_file_name, current_offset, append_mode) =
+            match db.allocate_free_space(current_chunk_size).map_err(|e| format!("DB free space error: {}", e))? {
+                Some((sf, off)) => {
+                    // Reuse existing free space
+                    (sf, off, false)
+                }
+                None => {
+                    // No free space available, append to end of store file
+                    let store_file_name = db
+                        .get_or_create_store_file(MAX_STORE_FILE_SIZE)
+                        .map_err(|e| format!("DB store file error: {}", e))?;
+                    let store_path = store_dir.join(&store_file_name);
+                    let current_offset = fs::metadata(&store_path)
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    (store_file_name, current_offset as i64, true)
+                }
+            };
+
+        let store_path = store_dir.join(&store_file_name);
+
         // Write chunk to store file
         {
-            let mut store = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&store_path)
-                .map_err(|e| format!("Failed to open store file: {}", e))?;
+            let mut store = if append_mode {
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&store_path)
+                    .map_err(|e| format!("Failed to open store file: {}", e))?
+            } else {
+                // Writing to reused free space - need write mode, seek to offset
+                let mut f = OpenOptions::new()
+                    .write(true)
+                    .open(&store_path)
+                    .map_err(|e| format!("Failed to open store file for reuse: {}", e))?;
+                use std::io::Seek;
+                f.seek(SeekFrom::Start(current_offset as u64))
+                    .map_err(|e| format!("Seek error: {}", e))?;
+                f
+            };
             store
                 .write_all(&buffer)
                 .map_err(|e| format!("Write to store error: {}", e))?;
@@ -137,13 +156,15 @@ pub fn import_file(
             file_id,
             chunk_index,
             store_file: store_file_name.clone(),
-            offset: current_offset as i64,
+            offset: current_offset,
             length: current_chunk_size,
         });
 
-        // Update store file used bytes
-        db.update_store_file_used(&store_file_name, current_chunk_size)
-            .map_err(|e| format!("DB update store error: {}", e))?;
+        if append_mode {
+            // Update store file used bytes only for new space
+            db.update_store_file_used(&store_file_name, current_chunk_size)
+                .map_err(|e| format!("DB update store error: {}", e))?;
+        }
 
         remaining -= current_chunk_size;
         chunk_index += 1;

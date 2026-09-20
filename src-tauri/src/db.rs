@@ -73,6 +73,17 @@ impl Database {
                 generated_at INTEGER
             );
 
+            CREATE TABLE IF NOT EXISTS free_space (
+                space_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                store_file   TEXT NOT NULL,
+                offset       INTEGER NOT NULL,
+                length       INTEGER NOT NULL,
+                created_at   INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_free_space_length
+                ON free_space(length);
+
             CREATE INDEX IF NOT EXISTS idx_chunk_locations_file_id
                 ON chunk_locations(file_id);
             CREATE INDEX IF NOT EXISTS idx_file_folder_folder_id
@@ -303,6 +314,24 @@ impl Database {
         Ok(())
     }
 
+    pub fn get_all_file_ids_in_folder_recursive(&self, folder_id: i64) -> Result<Vec<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT file_id FROM file_folder WHERE folder_id IN (
+                WITH RECURSIVE subfolders AS (
+                    SELECT folder_id FROM folders WHERE folder_id = ?
+                    UNION ALL
+                    SELECT f.folder_id FROM folders f
+                    JOIN subfolders s ON f.parent_id = s.folder_id
+                )
+                SELECT folder_id FROM subfolders
+            )"
+        )?;
+        let ids = stmt.query_map(params![folder_id], |row| row.get(0))?
+            .collect::<Result<Vec<i64>, _>>()?;
+        Ok(ids)
+    }
+
     pub fn rename_file(&self, file_id: i64, new_name: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let ext = Path::new(new_name)
@@ -384,6 +413,85 @@ impl Database {
         }
     }
 
+    /// 检查同一文件夹下是否已存在同名文件（排除指定file_id）
+    pub fn check_file_name_in_folder(&self, folder_id: i64, name: &str, exclude_file_id: Option<i64>) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let mut sql = String::from(
+            "SELECT COUNT(*) FROM files f
+             JOIN file_folder ff ON f.file_id = ff.file_id
+             WHERE ff.folder_id = ? AND f.name = ?"
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+            Box::new(folder_id),
+            Box::new(name.to_string()),
+        ];
+        if let Some(eid) = exclude_file_id {
+            sql.push_str(" AND f.file_id != ?");
+            params_vec.push(Box::new(eid));
+        }
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let count: i64 = conn.query_row(&sql, params_refs.as_slice(), |row| row.get(0))?;
+        Ok(count > 0)
+    }
+
+    /// 检查同一父文件夹下是否已存在同名子文件夹（排除指定folder_id）
+    pub fn check_folder_name_in_parent(&self, parent_id: Option<i64>, name: &str, exclude_folder_id: Option<i64>) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let mut sql = String::from("SELECT COUNT(*) FROM folders WHERE ");
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(name.to_string())];
+        match parent_id {
+            Some(pid) => {
+                sql.push_str("parent_id = ? AND name = ?");
+                params_vec.insert(0, Box::new(pid));
+            }
+            None => {
+                sql.push_str("parent_id IS NULL AND name = ?");
+            }
+        }
+        if let Some(eid) = exclude_folder_id {
+            sql.push_str(" AND folder_id != ?");
+            params_vec.push(Box::new(eid));
+        }
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let count: i64 = conn.query_row(&sql, params_refs.as_slice(), |row| row.get(0))?;
+        Ok(count > 0)
+    }
+
+    /// 重命名文件夹
+    pub fn rename_folder(&self, folder_id: i64, new_name: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE folders SET name = ? WHERE folder_id = ?",
+            params![new_name, folder_id],
+        )?;
+        Ok(())
+    }
+
+    /// 移动文件夹到另一个父文件夹
+    pub fn move_folder(&self, folder_id: i64, target_parent_id: Option<i64>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE folders SET parent_id = ? WHERE folder_id = ?",
+            params![target_parent_id, folder_id],
+        )?;
+        Ok(())
+    }
+
+    /// 获取文件所在的文件夹ID
+    pub fn get_file_folder_id(&self, file_id: i64) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT folder_id FROM file_folder WHERE file_id = ?",
+            params![file_id],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn search_files(&self, keyword: &str) -> Result<Vec<FileInfo>> {
         let conn = self.conn.lock().unwrap();
         let pattern = format!("%{}%", keyword);
@@ -413,5 +521,54 @@ impl Database {
             })
         })?.collect::<Result<Vec<_>>>()?;
         Ok(files)
+    }
+
+    /// Record freed space for later reuse
+    pub fn add_free_space(&self, store_file: &str, offset: i64, length: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO free_space (store_file, offset, length) VALUES (?, ?, ?)",
+            params![store_file, offset, length],
+        )?;
+        Ok(())
+    }
+
+    /// Find and allocate free space for a chunk. Returns Some((store_file, offset)) if found, None otherwise.
+    /// Uses best-fit strategy: finds the smallest free block >= needed size.
+    pub fn allocate_free_space(&self, needed: i64) -> Result<Option<(String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        // Find best-fit free space (smallest block >= needed)
+        let result: Option<(i64, String, i64)> = conn.query_row(
+            "SELECT space_id, store_file, offset FROM free_space
+             WHERE length >= ? ORDER BY length ASC LIMIT 1",
+            params![needed],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).ok();
+
+        if let Some((space_id, store_file, offset)) = result {
+            let remaining = {
+                let block_len: i64 = conn.query_row(
+                    "SELECT length FROM free_space WHERE space_id = ?",
+                    params![space_id],
+                    |row| row.get(0),
+                )?;
+                block_len - needed
+            };
+
+            if remaining > 0 {
+                // Shrink the free block
+                conn.execute(
+                    "UPDATE free_space SET offset = offset + ?, length = ? WHERE space_id = ?",
+                    params![needed, remaining, space_id],
+                )?;
+            } else {
+                // Use the entire block
+                conn.execute("DELETE FROM free_space WHERE space_id = ?", params![space_id])?;
+            }
+
+            Ok(Some((store_file, offset)))
+        } else {
+            Ok(None)
+        }
     }
 }

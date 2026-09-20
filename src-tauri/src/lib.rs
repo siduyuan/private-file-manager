@@ -38,6 +38,10 @@ fn create_folder(
     parent_id: Option<i64>,
 ) -> Result<i64, String> {
     let state = state.lock().unwrap();
+    // Windows风格：同级不能有同名文件夹
+    if state.db.check_folder_name_in_parent(parent_id, &name, None).map_err(|e| e.to_string())? {
+        return Err(format!("该文件夹下已存在名为 '{}' 的文件夹", name));
+    }
     state.db.create_folder(&name, parent_id).map_err(|e| e.to_string())
 }
 
@@ -192,18 +196,61 @@ fn import_directory(
 fn export_files(
     state: tauri::State<Mutex<AppState>>,
     file_ids: Vec<i64>,
+    folder_ids: Vec<i64>,
     target_dir: String,
 ) -> Result<Vec<String>, String> {
     let state = state.lock().unwrap();
     let target = PathBuf::from(&target_dir);
     let mut exported = Vec::new();
 
+    // 导出文件
     for file_id in file_ids {
         let path = storage::export_file(&state.db, &state.store_dir, file_id, &target)?;
         exported.push(path.to_str().unwrap_or("").to_string());
     }
 
+    // 导出文件夹（递归）
+    for folder_id in folder_ids {
+        export_folder_recursive(&state.db, &state.store_dir, folder_id, &target, &mut exported)?;
+    }
+
     Ok(exported)
+}
+
+fn export_folder_recursive(
+    db: &Database,
+    store_dir: &Path,
+    folder_id: i64,
+    target_base: &Path,
+    exported: &mut Vec<String>,
+) -> Result<(), String> {
+    // 获取文件夹信息
+    let folders = db.get_folders().map_err(|e| e.to_string())?;
+    let folder = folders.iter().find(|f| f.folder_id == folder_id)
+        .ok_or_else(|| format!("文件夹 {} 不存在", folder_id))?;
+    
+    // 创建文件夹
+    let folder_path = target_base.join(&folder.name);
+    std::fs::create_dir_all(&folder_path).map_err(|e| format!("创建文件夹失败: {}", e))?;
+    
+    // 导出文件夹内的文件
+    let files = db.get_files_in_folder(folder_id).map_err(|e| e.to_string())?;
+    for file in files {
+        let path = storage::export_file(db, store_dir, file.file_id, &folder_path)?;
+        exported.push(path.to_str().unwrap_or("").to_string());
+    }
+    
+    // 递归导出子文件夹
+    let sub_folders: Vec<i64> = folders.iter()
+        .filter(|f| f.parent_id == Some(folder_id))
+        .map(|f| f.folder_id)
+        .collect();
+    
+    for sub_folder_id in sub_folders {
+        export_folder_recursive(db, store_dir, sub_folder_id, &folder_path, exported)?;
+    }
+    
+    Ok(())
 }
 
 #[tauri::command]
@@ -239,9 +286,30 @@ fn delete_file(
     file_id: i64,
 ) -> Result<(), String> {
     let state = state.lock().unwrap();
-    let _chunks = state.db.delete_file(file_id).map_err(|e| e.to_string())?;
-    // Note: chunk data in store files is not physically removed
-    // Could implement space reclamation later
+    
+    // Get thumbnail path before deletion
+    let thumb_path = state.db.get_thumbnail_path(file_id).map_err(|e| e.to_string())?;
+    
+    // Get chunk locations before deletion (for recording free space)
+    let chunks = state.db.get_chunk_locations(file_id).map_err(|e| e.to_string())?;
+    
+    // Delete from database
+    state.db.delete_file(file_id).map_err(|e| e.to_string())?;
+    
+    // Record freed space for later reuse
+    for chunk in &chunks {
+        state.db.add_free_space(&chunk.store_file, chunk.offset, chunk.length)
+            .map_err(|e| format!("Failed to record free space: {}", e))?;
+    }
+    
+    // Delete thumbnail file if exists
+    if let Some(path) = thumb_path {
+        let thumb_file = std::path::Path::new(&path);
+        if thumb_file.exists() {
+            let _ = std::fs::remove_file(thumb_file);
+        }
+    }
+    
     Ok(())
 }
 
@@ -251,7 +319,41 @@ fn delete_folder(
     folder_id: i64,
 ) -> Result<(), String> {
     let state = state.lock().unwrap();
-    state.db.delete_folder(folder_id).map_err(|e| e.to_string())
+    
+    // Get all files in the folder and its subfolders before deletion
+    let file_ids = state.db.get_all_file_ids_in_folder_recursive(folder_id).map_err(|e| e.to_string())?;
+    
+    // Collect chunk locations and thumbnail paths for all files
+    let mut all_chunks = Vec::new();
+    let mut thumb_paths = Vec::new();
+    
+    for file_id in &file_ids {
+        if let Ok(Some(thumb_path)) = state.db.get_thumbnail_path(*file_id) {
+            thumb_paths.push(thumb_path);
+        }
+        if let Ok(chunks) = state.db.get_chunk_locations(*file_id) {
+            all_chunks.extend(chunks);
+        }
+    }
+    
+    // Delete folder and all associated database records
+    state.db.delete_folder(folder_id).map_err(|e| e.to_string())?;
+    
+    // Record freed space for later reuse
+    for chunk in &all_chunks {
+        state.db.add_free_space(&chunk.store_file, chunk.offset, chunk.length)
+            .map_err(|e| format!("Failed to record free space: {}", e))?;
+    }
+    
+    // Delete all thumbnail files
+    for path in thumb_paths {
+        let thumb_file = std::path::Path::new(&path);
+        if thumb_file.exists() {
+            let _ = std::fs::remove_file(thumb_file);
+        }
+    }
+    
+    Ok(())
 }
 
 #[tauri::command]
@@ -261,7 +363,31 @@ fn rename_file(
     new_name: String,
 ) -> Result<(), String> {
     let state = state.lock().unwrap();
+    // 获取文件当前所在文件夹
+    let folder_id = state.db.get_file_folder_id(file_id).map_err(|e| e.to_string())?
+        .ok_or_else(|| "文件不存在".to_string())?;
+    // Windows风格：同级不能有同名文件
+    if state.db.check_file_name_in_folder(folder_id, &new_name, Some(file_id)).map_err(|e| e.to_string())? {
+        return Err(format!("该文件夹下已存在名为 '{}' 的文件", new_name));
+    }
     state.db.rename_file(file_id, &new_name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn rename_folder(
+    state: tauri::State<Mutex<AppState>>,
+    folder_id: i64,
+    new_name: String,
+) -> Result<(), String> {
+    let state = state.lock().unwrap();
+    // 获取文件夹的父文件夹
+    let folders = state.db.get_folders().map_err(|e| e.to_string())?;
+    let parent_id = folders.iter().find(|f| f.folder_id == folder_id).and_then(|f| f.parent_id);
+    // Windows风格：同级不能有同名文件夹
+    if state.db.check_folder_name_in_parent(parent_id, &new_name, Some(folder_id)).map_err(|e| e.to_string())? {
+        return Err(format!("该文件夹下已存在名为 '{}' 的文件夹", new_name));
+    }
+    state.db.rename_folder(folder_id, &new_name).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -271,7 +397,43 @@ fn move_file(
     target_folder_id: i64,
 ) -> Result<(), String> {
     let state = state.lock().unwrap();
+    // 获取文件名
+    let file_info = state.db.get_file_info(file_id).map_err(|e| e.to_string())?
+        .ok_or_else(|| "文件不存在".to_string())?;
+    // Windows风格：目标文件夹下不能有同名文件
+    if state.db.check_file_name_in_folder(target_folder_id, &file_info.name, Some(file_id)).map_err(|e| e.to_string())? {
+        return Err(format!("目标文件夹下已存在名为 '{}' 的文件", file_info.name));
+    }
     state.db.move_file(file_id, target_folder_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn move_folder(
+    state: tauri::State<Mutex<AppState>>,
+    folder_id: i64,
+    target_parent_id: Option<i64>,
+) -> Result<(), String> {
+    let state = state.lock().unwrap();
+    let folders = state.db.get_folders().map_err(|e| e.to_string())?;
+    let folder = folders.iter().find(|f| f.folder_id == folder_id)
+        .ok_or_else(|| "文件夹不存在".to_string())?;
+    // 不能移动到自身或自身的子文件夹
+    if target_parent_id == Some(folder_id) {
+        return Err("不能将文件夹移动到自身".to_string());
+    }
+    // 检查是否是子文件夹（防止循环引用）
+    let mut check_id = target_parent_id;
+    while let Some(pid) = check_id {
+        if pid == folder_id {
+            return Err("不能将文件夹移动到其子文件夹中".to_string());
+        }
+        check_id = folders.iter().find(|f| f.folder_id == pid).and_then(|f| f.parent_id);
+    }
+    // Windows风格：目标父文件夹下不能有同名文件夹
+    if state.db.check_folder_name_in_parent(target_parent_id, &folder.name, Some(folder_id)).map_err(|e| e.to_string())? {
+        return Err(format!("目标文件夹下已存在名为 '{}' 的文件夹", folder.name));
+    }
+    state.db.move_folder(folder_id, target_parent_id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -393,7 +555,9 @@ pub fn run() {
             delete_file,
             delete_folder,
             rename_file,
+            rename_folder,
             move_file,
+            move_folder,
             search_files,
             get_thumbnail_path,
             list_dir,

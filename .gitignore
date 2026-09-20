@@ -23,4 +23,14 @@ dist-ssr
 *.sln
 *.sw?
 
+# Rust build artifacts
+src-tauri/target/
+*.pdb
+
+# Runtime data directory
+pfm_data/
+
+# Windows
+Thumbs.db
+
 testdata/*
