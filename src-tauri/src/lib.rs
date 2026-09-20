@@ -69,16 +69,22 @@ async fn import_files(
             // Import single file directly to target folder
             match storage::import_file(&db, &store_dir, &path, folder_id) {
                 Ok(file_id) => {
-                    // Generate thumbnail for images
+                    // Generate thumbnail for images and videos
                     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                    if matches!(ext.to_lowercase().as_str(), "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp") {
-                        let _ = storage::generate_image_thumbnail(
-                            &db,
-                            &store_dir,
-                            &thumb_dir,
-                            &temp_dir,
-                            file_id,
-                        );
+                    match ext.to_lowercase().as_str() {
+                        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" => {
+                            let _ = storage::generate_image_thumbnail(
+                                &db, &store_dir, &thumb_dir, &temp_dir, file_id,
+                            );
+                        }
+                        "mp4" | "avi" | "mkv" | "mov" | "wmv" | "flv" | "webm" => {
+                            if let Err(e) = storage::generate_video_thumbnail(
+                                &db, &store_dir, &thumb_dir, &temp_dir, file_id,
+                            ) {
+                                eprintln!("[thumbnail] video failed (file_id={}, path={}): {}", file_id, path_str, e);
+                            }
+                        }
+                        _ => {}
                     }
                     success_count += 1;
                 }
@@ -148,16 +154,20 @@ fn import_directory(
             // Import file to the newly created folder
             match storage::import_file(db, store_dir, &entry_path, new_folder_id) {
                 Ok(file_id) => {
-                    // Generate thumbnail for images
+                    // Generate thumbnail for images and videos
                     let ext = entry_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                    if matches!(ext.to_lowercase().as_str(), "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp") {
-                        let _ = storage::generate_image_thumbnail(
-                            db,
-                            store_dir,
-                            thumb_dir,
-                            temp_dir,
-                            file_id,
-                        );
+                    match ext.to_lowercase().as_str() {
+                        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" => {
+                            let _ = storage::generate_image_thumbnail(
+                                db, store_dir, thumb_dir, temp_dir, file_id,
+                            );
+                        }
+                        "mp4" | "avi" | "mkv" | "mov" | "wmv" | "flv" | "webm" => {
+                            let _ = storage::generate_video_thumbnail(
+                                db, store_dir, thumb_dir, temp_dir, file_id,
+                            );
+                        }
+                        _ => {}
                     }
                     success_count += 1;
                 }
@@ -356,6 +366,9 @@ pub fn run() {
             std::fs::create_dir_all(&thumb_dir.join("img")).ok();
             std::fs::create_dir_all(&thumb_dir.join("vid")).ok();
             std::fs::create_dir_all(&temp_dir).ok();
+
+            // Ensure ffmpeg binary is available for video thumbnail generation
+            let _ = ffmpeg_sidecar::download::auto_download();
 
             let db_path = app_data_dir.join("metadata.db");
             let database = Database::new(&db_path).expect("Failed to initialize database");

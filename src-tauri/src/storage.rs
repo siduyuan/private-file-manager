@@ -272,7 +272,21 @@ pub fn generate_image_thumbnail(
 ) -> Result<(), String> {
     let temp_path = extract_to_temp(db, store_dir, temp_dir, file_id)?;
 
-    let img = image::open(&temp_path).map_err(|e| format!("Image open error: {}", e))?;
+    // 根据文件内容自动检测格式，不依赖扩展名（有些文件扩展名与实际格式不符）
+    let img = match image::io::Reader::open(&temp_path) {
+        Ok(reader) => match reader.with_guessed_format() {
+            Ok(reader) => reader.decode(),
+            Err(e) => Err(image::ImageError::IoError(e)),
+        },
+        Err(e) => Err(image::ImageError::IoError(e)),
+    };
+    let img = match img {
+        Ok(img) => img,
+        Err(e) => {
+            let _ = fs::remove_file(&temp_path);
+            return Err(format!("image decode failed: {}", e));
+        }
+    };
 
     let thumbnail = img.thumbnail(256, 256);
 
@@ -282,10 +296,56 @@ pub fn generate_image_thumbnail(
     let thumb_path = img_dir.join(format!("{}.webp", file_id));
     thumbnail
         .save(&thumb_path)
-        .map_err(|e| format!("Save thumbnail error: {}", e))?;
+        .map_err(|e| {
+            let _ = fs::remove_file(&temp_path);
+            format!("save webp failed: {}", e)
+        })?;
+
+    let _ = fs::remove_file(&temp_path);
+
+    db.set_thumbnail_path(file_id, thumb_path.to_str().unwrap_or(""))
+        .map_err(|e| format!("DB thumbnail error: {}", e))?;
+
+    Ok(())
+}
+
+/// Generate thumbnail for a video file using ffmpeg
+pub fn generate_video_thumbnail(
+    db: &Database,
+    store_dir: &Path,
+    thumb_dir: &Path,
+    temp_dir: &Path,
+    file_id: i64,
+) -> Result<(), String> {
+    let temp_path = extract_to_temp(db, store_dir, temp_dir, file_id)?;
+
+    let vid_dir = thumb_dir.join("vid");
+    fs::create_dir_all(&vid_dir).map_err(|e| format!("Create dir error: {}", e))?;
+
+    let thumb_path = vid_dir.join(format!("{}.webp", file_id));
+
+    // Extract a single frame at 1 second using ffmpeg
+    let mut child = ffmpeg_sidecar::command::FfmpegCommand::new()
+        .args(["-y", "-ss", "1", "-i"])
+        .arg(&temp_path)
+        .args(["-vframes", "1", "-q:v", "2"])
+        .arg(&thumb_path)
+        .spawn()
+        .map_err(|e| format!("FFmpeg spawn error: {}", e))?;
+
+    // Consume the iterator to wait for ffmpeg to finish
+    if let Ok(iter) = child.iter() {
+        for _ in iter {}
+    }
 
     // Clean up temp file
     let _ = fs::remove_file(&temp_path);
+
+    // Check if ffmpeg exited successfully
+    let status = child.as_inner_mut().wait().map_err(|e| format!("FFmpeg wait error: {}", e))?;
+    if !status.success() {
+        return Err("FFmpeg frame extraction failed".to_string());
+    }
 
     db.set_thumbnail_path(file_id, thumb_path.to_str().unwrap_or(""))
         .map_err(|e| format!("DB thumbnail error: {}", e))?;

@@ -3,7 +3,6 @@ import { Layout, Tree, Table, Button, Input, Space, Breadcrumb, Dropdown, messag
 import {
   FolderOutlined,
   FolderOpenOutlined,
-  FileOutlined,
   ImportOutlined,
   ExportOutlined,
   DeleteOutlined,
@@ -29,7 +28,7 @@ import {
   FaMarkdown,
   FaWindows
 } from 'react-icons/fa';
-import { invoke } from '@tauri-apps/api/core';
+import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import type { DataNode } from 'antd/es/tree';
 import type { MenuProps } from 'antd';
@@ -76,35 +75,35 @@ function formatTime(timestamp: number): string {
 
 function getFileIcon(category: string | null, ext?: string | null) {
   const extension = ext?.toLowerCase();
-  
-  // 根据扩展名显示更精确的图标
+
+  // 根据扩展名显示更精确的图标（不设置 fontSize，由父容器控制大小）
   if (extension) {
     switch (extension) {
       // 文档
       case 'pdf':
-        return <FaFilePdf style={{ color: '#ff4d4f', fontSize: 16 }} />;
+        return <FaFilePdf style={{ color: '#ff4d4f' }} />;
       case 'doc':
       case 'docx':
-        return <FaFileWord style={{ color: '#2b579a', fontSize: 16 }} />;
+        return <FaFileWord style={{ color: '#2b579a' }} />;
       case 'xls':
       case 'xlsx':
-        return <FaFileExcel style={{ color: '#217346', fontSize: 16 }} />;
+        return <FaFileExcel style={{ color: '#217346' }} />;
       case 'ppt':
       case 'pptx':
-        return <FaFilePowerpoint style={{ color: '#d24726', fontSize: 16 }} />;
+        return <FaFilePowerpoint style={{ color: '#d24726' }} />;
       case 'txt':
-        return <FaFileAlt style={{ color: '#8c8c8c', fontSize: 16 }} />;
+        return <FaFileAlt style={{ color: '#8c8c8c' }} />;
       case 'md':
-        return <FaMarkdown style={{ color: '#083fa1', fontSize: 16 }} />;
-      
+        return <FaMarkdown style={{ color: '#083fa1' }} />;
+
       // 压缩包
       case 'zip':
       case 'rar':
       case '7z':
       case 'tar':
       case 'gz':
-        return <FaFileArchive style={{ color: '#faad14', fontSize: 16 }} />;
-      
+        return <FaFileArchive style={{ color: '#faad14' }} />;
+
       // 代码
       case 'js':
       case 'ts':
@@ -124,13 +123,13 @@ function getFileIcon(category: string | null, ext?: string | null) {
       case 'xml':
       case 'yaml':
       case 'yml':
-        return <FaFileCode style={{ color: '#1890ff', fontSize: 16 }} />;
-      
+        return <FaFileCode style={{ color: '#1890ff' }} />;
+
       // 可执行文件
       case 'exe':
       case 'msi':
-        return <FaWindows style={{ color: '#0078d4', fontSize: 16 }} />;
-      
+        return <FaWindows style={{ color: '#0078d4' }} />;
+
       // 图片
       case 'jpg':
       case 'jpeg':
@@ -140,8 +139,8 @@ function getFileIcon(category: string | null, ext?: string | null) {
       case 'webp':
       case 'svg':
       case 'ico':
-        return <FaFileImage style={{ color: '#52c41a', fontSize: 16 }} />;
-      
+        return <FaFileImage style={{ color: '#52c41a' }} />;
+
       // 视频
       case 'mp4':
       case 'avi':
@@ -150,8 +149,8 @@ function getFileIcon(category: string | null, ext?: string | null) {
       case 'wmv':
       case 'flv':
       case 'webm':
-        return <FaFileVideo style={{ color: '#722ed1', fontSize: 16 }} />;
-      
+        return <FaFileVideo style={{ color: '#722ed1' }} />;
+
       // 音频
       case 'mp3':
       case 'wav':
@@ -159,17 +158,17 @@ function getFileIcon(category: string | null, ext?: string | null) {
       case 'aac':
       case 'ogg':
       case 'wma':
-        return <FaFileAudio style={{ color: '#eb2f96', fontSize: 16 }} />;
+        return <FaFileAudio style={{ color: '#eb2f96' }} />;
     }
   }
-  
+
   // 根据类别显示默认图标
   switch (category) {
-    case 'image': return <FaFileImage style={{ color: '#52c41a', fontSize: 16 }} />;
+    case 'image': return <FaFileImage style={{ color: '#52c41a' }} />;
     case 'video_short':
-    case 'video_long': return <FaFileVideo style={{ color: '#722ed1', fontSize: 16 }} />;
-    case 'doc': return <FaFileAlt style={{ color: '#8c8c8c', fontSize: 16 }} />;
-    default: return <FaFile style={{ color: '#8c8c8c', fontSize: 16 }} />;
+    case 'video_long': return <FaFileVideo style={{ color: '#722ed1' }} />;
+    case 'doc': return <FaFileAlt style={{ color: '#8c8c8c' }} />;
+    default: return <FaFile style={{ color: '#8c8c8c' }} />;
   }
 }
 
@@ -180,7 +179,7 @@ function App() {
   const [selectedFileIds, setSelectedFileIds] = useState<number[]>([]);
   const [searchKeyword, setSearchKeyword] = useState('');
   const [viewMode, setViewMode] = useState<'list' | 'grid'>('list');
-  const [loading, setLoading] = useState(false);
+  const [, setLoading] = useState(false);
   const [breadcrumb, setBreadcrumb] = useState<{ id: number; name: string }[]>([
     { id: 1, name: '根目录' },
   ]);
@@ -587,8 +586,21 @@ function App() {
                     dataIndex: 'name',
                     key: 'name',
                     render: (name: string, record: any) => (
-                      <span>
-                        {record.isFolder ? <FolderOutlined style={{ color: '#faad14' }} /> : getFileIcon(record.category, record.ext)} {name}
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                        {record.isFolder ? (
+                          <FolderOutlined style={{ color: '#faad14', fontSize: 16 }} />
+                        ) : record.thumbnail_path ? (
+                          <img
+                            src={convertFileSrc(record.thumbnail_path)}
+                            alt={name}
+                            style={{ width: 28, height: 28, objectFit: 'cover', borderRadius: 3, flexShrink: 0 }}
+                          />
+                        ) : (
+                          <span style={{ fontSize: 16, display: 'inline-flex' }}>
+                            {getFileIcon(record.category, record.ext)}
+                          </span>
+                        )}
+                        <span>{name}</span>
                       </span>
                     ),
                   },
@@ -744,13 +756,13 @@ function App() {
                   >
                     <div style={{ width: 80, height: 80, marginBottom: 4, display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}>
                       {file.thumbnail_path ? (
-                        <img 
-                          src={`file://${file.thumbnail_path}`}
+                        <img
+                          src={convertFileSrc(file.thumbnail_path)}
                           alt={file.name}
-                          style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'cover' }}
+                          style={{ width: '100%', height: '100%', objectFit: 'cover' }}
                         />
                       ) : (
-                        <div style={{ fontSize: 40 }}>
+                        <div style={{ fontSize: 40, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                           {getFileIcon(file.category, file.ext)}
                         </div>
                       )}
