@@ -1131,24 +1131,25 @@ fn check_integrity(
 }
 
 #[tauri::command]
-fn check_auth_status(state: tauri::State<Mutex<AppState>>) -> Result<bool, String> {
+fn check_auth_status(state: tauri::State<Mutex<AppState>>) -> Result<AuthStatus, String> {
     let state = state.lock().unwrap();
     let default_conn = state.registry.get_default_connection()
         .ok_or("默认数据库未配置")?;
     let db_path = PathBuf::from(&default_conn.path).join("metadata.db");
     if !db_path.exists() {
-        return Ok(true); // No DB = no auth needed
+        return Ok(AuthStatus { auth_required: false, logged_in: true });
     }
     let database = Database::new(&db_path).map_err(|e| e.to_string())?;
     let props = database.get_db_properties().map_err(|e| e.to_string())?;
-    Ok(props.password_hash.is_none())
+    let auth_required = props.password_hash.is_some();
+    Ok(AuthStatus { auth_required, logged_in: !auth_required })
 }
 
 #[tauri::command]
 fn login(
     state: tauri::State<Mutex<AppState>>,
     password: String,
-) -> Result<bool, String> {
+) -> Result<(), String> {
     let state = state.lock().unwrap();
     let default_conn = state.registry.get_default_connection()
         .ok_or("默认数据库未配置")?;
@@ -1158,9 +1159,12 @@ fn login(
     match props.password_hash {
         Some(ref stored_hash) => {
             let hash = hash_password(&password);
-            Ok(hash == *stored_hash)
+            if hash != *stored_hash {
+                return Err("密码错误".to_string());
+            }
+            Ok(())
         }
-        None => Ok(true),
+        None => Ok(()),
     }
 }
 

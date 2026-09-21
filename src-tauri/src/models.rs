@@ -116,3 +116,9 @@ pub struct IntegrityCheckResult {
     pub valid: bool,
     pub details: Vec<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthStatus {
+    pub auth_required: bool,
+    pub logged_in: bool,
+}

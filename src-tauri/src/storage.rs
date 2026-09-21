@@ -92,6 +92,10 @@ pub fn import_file(
     let mut chunk_data: Vec<(String, i64, i64, i64)> = Vec::new();
     // (store_file, additional_bytes) for new appends
     let mut store_file_updates: Vec<(String, i64)> = Vec::new();
+    // (store_file, offset, remaining_length) 需要回写的残余free_space
+    let mut new_free_space: Vec<(String, i64, i64)> = Vec::new();
+    // 需要确保在store_files表中存在的store文件
+    let mut new_store_files: Vec<String> = Vec::new();
 
     let mut remaining = file_size;
 
@@ -104,25 +108,31 @@ pub fn import_file(
             .read_exact(&mut buffer)
             .map_err(|e| format!("Read error: {}", e))?;
 
-        // 只读查询：优先使用free_space
-        let (store_file_name, current_offset, space_id) =
+        // 优先使用free_space（Best-fit）
+        let (store_file_name, current_offset, space_id, free_length) =
             match db.find_free_space(current_chunk_size).map_err(|e| format!("DB free space error: {}", e))? {
                 Some((sid, sf, off)) => {
-                    (sf, off, sid)
+                    // 查询free_space条目的实际长度
+                    let free_len = db.get_free_space_length(sid).map_err(|e| format!("DB error: {}", e))?;
+                    (sf, off, sid, free_len)
                 }
                 None => {
-                    // 只读查询：查找有空间的store_file
-                    let store_file_name = match db.find_available_store_file(MAX_STORE_FILE_SIZE)
+                    // 查找有空间的store_file
+                    let store_file_name = match db.find_available_store_file(store_dir, MAX_STORE_FILE_SIZE)
                         .map_err(|e| format!("DB store file error: {}", e))? {
                         Some(sf) => sf,
-                        None => db.get_next_store_file_name()
-                            .map_err(|e| format!("DB error: {}", e))?,
+                        None => {
+                            let name = db.get_next_store_file_name()
+                                .map_err(|e| format!("DB error: {}", e))?;
+                            new_store_files.push(name.clone());
+                            name
+                        }
                     };
                     let store_path = store_dir.join(&store_file_name);
                     let current_offset = fs::metadata(&store_path)
                         .map(|m| m.len())
                         .unwrap_or(0);
-                    (store_file_name, current_offset as i64, 0i64)
+                    (store_file_name, current_offset as i64, 0i64, 0i64)
                 }
             };
 
@@ -153,7 +163,14 @@ pub fn import_file(
                 .map_err(|e| format!("Write to store error: {}", e))?;
         }
 
-        if space_id == 0 {
+        if space_id > 0 {
+            // 使用了free_space，处理残余空间
+            let remainder = free_length - current_chunk_size;
+            if remainder > 0 {
+                // 残余空间回写为新的free_space条目
+                new_free_space.push((store_file_name.clone(), current_offset + current_chunk_size, remainder));
+            }
+        } else {
             // Track new append for store_files update
             if let Some(entry) = store_file_updates.iter_mut().find(|(sf, _)| sf == &store_file_name) {
                 entry.1 += current_chunk_size;
@@ -167,9 +184,9 @@ pub fn import_file(
         remaining -= current_chunk_size;
     }
 
-    // 阶段2：原子提交所有DB记录（文件 + 分片位置 + free_space消耗 + store_files更新）
+    // 阶段2：原子提交所有DB记录（文件 + 分片位置 + free_space消耗/回写 + store_files更新）
     let file_id = db
-        .insert_file_with_chunks(&file_info, folder_id, &chunk_data, &store_file_updates)
+        .insert_file_with_chunks(&file_info, folder_id, &chunk_data, &store_file_updates, &new_free_space, &new_store_files)
         .map_err(|e| format!("DB insert error: {}", e))?;
 
     Ok(file_id)

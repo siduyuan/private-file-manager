@@ -175,7 +175,7 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
-    /// 原子插入文件记录 + 分片位置 + 更新store_files用量 + 消耗free_space
+    /// 原子插入文件记录 + 分片位置 + 更新store_files用量 + 消耗free_space + 回写残余free_space
     /// 所有DB写操作在同一事务中，保证数据一致性
     pub fn insert_file_with_chunks(
         &self,
@@ -183,6 +183,8 @@ impl Database {
         folder_id: i64,
         chunks: &[(String, i64, i64, i64)], // (store_file, offset, length, space_id or 0)
         store_file_updates: &[(String, i64)], // (store_file, additional_bytes) for new appends
+        new_free_space: &[(String, i64, i64)], // (store_file, offset, length) 残余空间回写
+        new_store_files: &[String], // 新创建的store文件名，需要INSERT到store_files表
     ) -> Result<i64> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -219,6 +221,22 @@ impl Database {
             }
         }
 
+        // 回写残余free_space
+        for (store_file, offset, length) in new_free_space.iter() {
+            tx.execute(
+                "INSERT INTO free_space (store_file, offset, length) VALUES (?, ?, ?)",
+                params![store_file, offset, length],
+            )?;
+        }
+
+        // 确保新store文件在store_files表中有记录
+        for store_file in new_store_files.iter() {
+            tx.execute(
+                "INSERT OR IGNORE INTO store_files (store_file, used_bytes) VALUES (?, 0)",
+                params![store_file],
+            )?;
+        }
+
         // 新追加的store_file更新used_bytes
         for (store_file, additional) in store_file_updates.iter() {
             tx.execute(
@@ -249,15 +267,36 @@ impl Database {
         Ok(chunks)
     }
 
-    /// 只读查询：查找可用store_file（不创建新记录）
-    pub fn find_available_store_file(&self, max_size: i64) -> Result<Option<String>> {
+    /// 获取free_space条目的长度
+    pub fn get_free_space_length(&self, space_id: i64) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
-        let result: Option<String> = conn.query_row(
-            "SELECT store_file FROM store_files WHERE used_bytes < ? ORDER BY store_file LIMIT 1",
-            params![max_size],
+        let length: i64 = conn.query_row(
+            "SELECT length FROM free_space WHERE space_id = ?",
+            params![space_id],
             |row| row.get(0),
-        ).ok();
-        Ok(result)
+        )?;
+        Ok(length)
+    }
+
+    /// 查找有剩余容量的store_file（基于实际文件大小而非used_bytes）
+    pub fn find_available_store_file(&self, store_dir: &std::path::Path, max_size: i64) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT store_file FROM store_files ORDER BY store_file"
+        )?;
+        let files: Vec<String> = stmt.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>>>()?;
+        drop(stmt);
+
+        for sf in &files {
+            let store_path = store_dir.join(sf);
+            let actual_size = std::fs::metadata(&store_path)
+                .map(|m| m.len() as i64)
+                .unwrap_or(0);
+            if actual_size < max_size {
+                return Ok(Some(sf.clone()));
+            }
+        }
+        Ok(None)
     }
 
     /// 只读查询：获取下一个store_file名称
