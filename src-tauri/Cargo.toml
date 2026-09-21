@@ -32,6 +32,8 @@ image = "0.25"
 mime_guess = "2"
 tempfile = "3"
 ffmpeg-sidecar = "2"
+sha2 = "0.10"
+dirs = "5"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

@@ -90,8 +90,17 @@ impl Database {
                 ON file_folder(folder_id);
             CREATE INDEX IF NOT EXISTS idx_files_category
                 ON files(category);
+
+            CREATE TABLE IF NOT EXISTS db_properties (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            );
             "
         )?;
+
+        // 确保 db_properties 有默认值
+        self.ensure_db_property(&conn, "db_type", "local")?;
+        self.ensure_db_property(&conn, "display_name", "")?;
 
         // Create root folder if not exists
         let root_count: i64 = conn.query_row(
@@ -634,5 +643,118 @@ impl Database {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).ok();
         Ok(result)
+    }
+
+    // ==================== 数据库属性管理 ====================
+
+    fn ensure_db_property(&self, conn: &Connection, key: &str, default_value: &str) -> Result<()> {
+        let exists: bool = conn.query_row(
+            "SELECT COUNT(*) FROM db_properties WHERE key = ?",
+            params![key],
+            |row| row.get::<_, i64>(0),
+        ).map(|c| c > 0)?;
+        if !exists {
+            conn.execute(
+                "INSERT INTO db_properties (key, value) VALUES (?, ?)",
+                params![key, default_value],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn init_db_properties(&self, uuid: &str, display_name: &str, db_type: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO db_properties (key, value) VALUES ('uuid', ?)",
+            params![uuid],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO db_properties (key, value) VALUES ('display_name', ?)",
+            params![display_name],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO db_properties (key, value) VALUES ('db_type', ?)",
+            params![db_type],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_db_properties(&self) -> Result<DbProperties> {
+        let conn = self.conn.lock().unwrap();
+        let get_prop = |key: &str| -> Result<Option<String>> {
+            let result = conn.query_row(
+                "SELECT value FROM db_properties WHERE key = ?",
+                params![key],
+                |row| row.get(0),
+            );
+            match result {
+                Ok(v) => Ok(Some(v)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(e),
+            }
+        };
+        Ok(DbProperties {
+            uuid: get_prop("uuid")?.unwrap_or_default(),
+            display_name: get_prop("display_name")?.unwrap_or_default(),
+            db_type: get_prop("db_type")?.unwrap_or_else(|| "local".to_string()),
+            password_hash: get_prop("password_hash")?,
+        })
+    }
+
+    pub fn set_password_hash(&self, hash: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        match hash {
+            Some(h) => conn.execute(
+                "INSERT OR REPLACE INTO db_properties (key, value) VALUES ('password_hash', ?)",
+                params![h],
+            )?,
+            None => conn.execute(
+                "DELETE FROM db_properties WHERE key = 'password_hash'",
+                [],
+            )?,
+        };
+        Ok(())
+    }
+
+    pub fn set_display_name(&self, name: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO db_properties (key, value) VALUES ('display_name', ?)",
+            params![name],
+        )?;
+        Ok(())
+    }
+
+    pub fn check_integrity(&self) -> Result<(bool, Vec<String>)> {
+        let conn = self.conn.lock().unwrap();
+        let mut details = Vec::new();
+
+        let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        if integrity != "ok" {
+            details.push(format!("SQLite完整性检查失败: {}", integrity));
+            return Ok((false, details));
+        }
+
+        let required_tables = ["files", "folders", "file_folder", "chunk_locations", "store_files", "thumbnail_index", "free_space", "db_properties"];
+        for table in &required_tables {
+            let exists: bool = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+                params![table],
+                |row| row.get::<_, i64>(0),
+            ).map(|c| c > 0)?;
+            if !exists {
+                details.push(format!("缺少表: {}", table));
+            }
+        }
+
+        let orphan_chunks: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM chunk_locations WHERE file_id NOT IN (SELECT file_id FROM files)",
+            [], |row| row.get(0),
+        )?;
+        if orphan_chunks > 0 {
+            details.push(format!("发现 {} 条孤儿分片记录", orphan_chunks));
+        }
+
+        Ok((details.is_empty(), details))
     }
 }

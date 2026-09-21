@@ -12,6 +12,9 @@ import {
   AppstoreOutlined,
   UnorderedListOutlined,
   ReloadOutlined,
+  SettingOutlined,
+  DatabaseOutlined,
+  LockOutlined,
 } from '@ant-design/icons';
 import { 
   FaFilePdf, 
@@ -32,6 +35,7 @@ import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import type { DataNode } from 'antd/es/tree';
 import type { MenuProps } from 'antd';
+import Settings from './Settings';
 import './App.css';
 
 interface FileInfo {
@@ -86,6 +90,21 @@ interface BatchResult {
   success_count: number;
   fail_count: number;
   errors: string[];
+}
+
+interface DbConnectionInfo {
+  uuid: string;
+  display_name: string;
+  db_type: string;
+  path: string;
+  is_connected: boolean;
+  is_default: boolean;
+  has_password: boolean;
+}
+
+interface AuthStatus {
+  auth_required: boolean;
+  logged_in: boolean;
 }
 
 function formatFileSize(bytes: number): string {
@@ -209,6 +228,16 @@ function App() {
   const [breadcrumb, setBreadcrumb] = useState<{ id: number; name: string }[]>([
     { id: 1, name: '根目录' },
   ]);
+
+  // 认证 & 数据库管理状态
+  const [appReady, setAppReady] = useState(false);
+  const [authRequired, setAuthRequired] = useState(false);
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [loginPassword, setLoginPassword] = useState('');
+  const [loginLoading, setLoginLoading] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [connections, setConnections] = useState<DbConnectionInfo[]>([]);
+  const [currentDb, setCurrentDb] = useState<DbConnectionInfo | null>(null);
   const [renameModalOpen, setRenameModalOpen] = useState(false);
   const [renameValue, setRenameValue] = useState('');
   const [renameFileId, setRenameFileId] = useState<number | null>(null);
@@ -241,6 +270,65 @@ function App() {
   // 右键菜单
   const [contextMenuRecord, setContextMenuRecord] = useState<any>(null);
   const [contextMenuPos, setContextMenuPos] = useState<{ x: number; y: number } | null>(null);
+
+  const loadConnections = useCallback(async () => {
+    try {
+      const conns = await invoke<DbConnectionInfo[]>('list_connections');
+      setConnections(conns);
+      const current = await invoke<DbConnectionInfo | null>('get_current_db');
+      setCurrentDb(current);
+    } catch (e) {
+      console.error('Failed to load connections:', e);
+    }
+  }, []);
+
+  const handleLogin = async () => {
+    if (!loginPassword) return;
+    setLoginLoading(true);
+    try {
+      await invoke('login', { password: loginPassword });
+      setIsLoggedIn(true);
+      setAuthRequired(false);
+      loadConnections();
+    } catch (e) {
+      message.error('密码错误');
+    } finally {
+      setLoginLoading(false);
+      setLoginPassword('');
+    }
+  };
+
+  const handleSwitchDatabase = async (uuid: string) => {
+    try {
+      await invoke('switch_database', { uuid });
+      message.success('数据库已切换');
+      setCurrentFolderId(1);
+      setBreadcrumb([{ id: 1, name: '根目录' }]);
+      loadConnections();
+      loadFolders();
+      loadFolderContents(1);
+    } catch (e) {
+      message.error('切换失败: ' + e);
+    }
+  };
+
+  // 启动时检查认证状态
+  useEffect(() => {
+    (async () => {
+      try {
+        const status = await invoke<AuthStatus>('check_auth_status');
+        setAuthRequired(status.auth_required);
+        setIsLoggedIn(status.logged_in);
+        if (!status.auth_required || status.logged_in) {
+          loadConnections();
+        }
+      } catch (e) {
+        console.error('Auth check failed:', e);
+      } finally {
+        setAppReady(true);
+      }
+    })();
+  }, []);
 
   const loadFolders = useCallback(async () => {
     try {
@@ -836,6 +924,51 @@ function App() {
     ];
   };
 
+  // 应用初始化加载中
+  if (!appReady) {
+    return (
+      <div style={{ height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        <Space direction="vertical" align="center">
+          <DatabaseOutlined style={{ fontSize: 48, color: '#1890ff' }} />
+          <span>正在初始化...</span>
+        </Space>
+      </div>
+    );
+  }
+
+  // 需要登录但未登录
+  if (authRequired && !isLoggedIn) {
+    return (
+      <div style={{ height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f0f2f5' }}>
+        <div style={{ width: 360, padding: 32, background: '#fff', borderRadius: 8, boxShadow: '0 2px 8px rgba(0,0,0,0.15)' }}>
+          <div style={{ textAlign: 'center', marginBottom: 24 }}>
+            <DatabaseOutlined style={{ fontSize: 48, color: '#1890ff' }} />
+            <h2 style={{ margin: '12px 0 0' }}>私有文件管理器</h2>
+          </div>
+          <Input.Password
+            prefix={<LockOutlined />}
+            placeholder="请输入密码"
+            value={loginPassword}
+            onChange={e => setLoginPassword(e.target.value)}
+            onPressEnter={handleLogin}
+            autoFocus
+            size="large"
+          />
+          <Button
+            type="primary"
+            block
+            size="large"
+            style={{ marginTop: 16 }}
+            onClick={handleLogin}
+            loading={loginLoading}
+          >
+            登录
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <Layout style={{ height: '100vh' }}>
       {/* Toolbar */}
@@ -873,15 +1006,47 @@ function App() {
             icon={viewMode === 'list' ? <UnorderedListOutlined /> : <AppstoreOutlined />}
             onClick={() => setViewMode(viewMode === 'list' ? 'grid' : 'list')}
           />
+          <Tooltip title="设置">
+            <Button icon={<SettingOutlined />} onClick={() => setSettingsOpen(true)} />
+          </Tooltip>
         </Space>
       </Layout.Header>
 
       <Layout style={{ flex: 1, overflow: 'hidden' }}>
         {/* Sidebar - Directory Tree */}
         <Layout.Sider 
-          width={180} 
-          style={{ background: '#fff', borderRight: '1px solid #f0f0f0', overflow: 'auto' }}
+          width={200} 
+          style={{ background: '#fff', borderRight: '1px solid #f0f0f0', overflow: 'auto', display: 'flex', flexDirection: 'column' }}
         >
+          {/* 当前数据库 */}
+          {currentDb && (
+            <div style={{ padding: '8px 12px', borderBottom: '1px solid #f0f0f0', background: '#fafafa' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <Space size={4}>
+                  <DatabaseOutlined style={{ color: '#1890ff' }} />
+                  <span style={{ fontWeight: 'bold', fontSize: 13 }}>{currentDb.display_name}</span>
+                </Space>
+                {connections.length > 1 && (
+                  <Dropdown
+                    menu={{
+                      items: connections
+                        .filter(c => c.uuid !== currentDb.uuid && c.is_connected)
+                        .map(c => ({
+                          key: c.uuid,
+                          label: c.display_name + (c.is_default ? ' (默认)' : ''),
+                          onClick: () => handleSwitchDatabase(c.uuid),
+                        })),
+                    }}
+                    trigger={['click']}
+                  >
+                    <Button type="text" size="small" title="切换数据库">
+                      <DatabaseOutlined />
+                    </Button>
+                  </Dropdown>
+                )}
+              </div>
+            </div>
+          )}
           <div style={{ padding: '8px 12px', fontWeight: 'bold', borderBottom: '1px solid #f0f0f0' }}>
             <HomeOutlined /> 目录
           </div>
@@ -892,7 +1057,7 @@ function App() {
             treeData={buildTreeData(folders)}
             selectedKeys={[currentFolderId]}
             onSelect={handleFolderSelect}
-            style={{ padding: '8px' }}
+            style={{ padding: '8px', flex: 1 }}
           />
         </Layout.Sider>
 
@@ -1361,6 +1526,14 @@ function App() {
           </div>
         </>
       )}
+
+      {/* 设置页面 */}
+      <Settings
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        onConnectionsChanged={loadConnections}
+        onSwitchDatabase={handleSwitchDatabase}
+      />
     </Layout>
   );
 }

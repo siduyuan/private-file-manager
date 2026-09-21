@@ -69,3 +69,50 @@ pub struct BatchResult {
     pub fail_count: i32,
     pub errors: Vec<String>,
 }
+
+// ==================== 数据库管理模型 ====================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbProperties {
+    pub uuid: String,
+    pub display_name: String,
+    pub db_type: String,
+    pub password_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbConnectionInfo {
+    pub uuid: String,
+    pub display_name: String,
+    pub db_type: String,
+    pub path: String,
+    pub is_connected: bool,
+    pub is_default: bool,
+    pub has_password: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateDbRequest {
+    pub path: String,
+    pub password: Option<String>,
+    pub display_name: Option<String>,
+    pub db_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateDbResult {
+    pub uuid: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PasswordVerifyResult {
+    pub valid: bool,
+    pub has_password: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntegrityCheckResult {
+    pub valid: bool,
+    pub details: Vec<String>,
+}
