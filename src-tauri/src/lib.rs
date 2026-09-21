@@ -290,17 +290,8 @@ fn delete_file(
     // Get thumbnail path before deletion
     let thumb_path = state.db.get_thumbnail_path(file_id).map_err(|e| e.to_string())?;
     
-    // Get chunk locations before deletion (for recording free space)
-    let chunks = state.db.get_chunk_locations(file_id).map_err(|e| e.to_string())?;
-    
-    // Delete from database
+    // Delete from database (free_space is recorded atomically in the transaction)
     state.db.delete_file(file_id).map_err(|e| e.to_string())?;
-    
-    // Record freed space for later reuse
-    for chunk in &chunks {
-        state.db.add_free_space(&chunk.store_file, chunk.offset, chunk.length)
-            .map_err(|e| format!("Failed to record free space: {}", e))?;
-    }
     
     // Delete thumbnail file if exists
     if let Some(path) = thumb_path {
@@ -320,30 +311,17 @@ fn delete_folder(
 ) -> Result<(), String> {
     let state = state.lock().unwrap();
     
-    // Get all files in the folder and its subfolders before deletion
+    // Get all thumbnail paths before deletion
     let file_ids = state.db.get_all_file_ids_in_folder_recursive(folder_id).map_err(|e| e.to_string())?;
-    
-    // Collect chunk locations and thumbnail paths for all files
-    let mut all_chunks = Vec::new();
     let mut thumb_paths = Vec::new();
-    
     for file_id in &file_ids {
         if let Ok(Some(thumb_path)) = state.db.get_thumbnail_path(*file_id) {
             thumb_paths.push(thumb_path);
         }
-        if let Ok(chunks) = state.db.get_chunk_locations(*file_id) {
-            all_chunks.extend(chunks);
-        }
     }
     
-    // Delete folder and all associated database records
+    // Delete folder and all associated database records (free_space recorded atomically)
     state.db.delete_folder(folder_id).map_err(|e| e.to_string())?;
-    
-    // Record freed space for later reuse
-    for chunk in &all_chunks {
-        state.db.add_free_space(&chunk.store_file, chunk.offset, chunk.length)
-            .map_err(|e| format!("Failed to record free space: {}", e))?;
-    }
     
     // Delete all thumbnail files
     for path in thumb_paths {
@@ -574,6 +552,7 @@ fn get_breadcrumb_path(
 }
 
 /// 批量删除（混合文件和文件夹ID），后端负责类型判断
+/// free_space在db层事务中原子记录，无需调用方单独处理
 #[tauri::command]
 fn batch_delete(
     state: tauri::State<Mutex<AppState>>,
@@ -588,43 +567,43 @@ fn batch_delete(
     for id in &ids {
         let is_folder = all_folders.iter().any(|f| f.folder_id == *id);
         if is_folder {
-            // 收集文件夹递归下的所有文件信息
+            // 收集缩略图路径（只读）
+            let mut thumbs_to_delete = Vec::new();
             if let Ok(file_ids) = state.db.get_all_file_ids_in_folder_recursive(*id) {
                 for file_id in &file_ids {
-                    if let Ok(chunks) = state.db.get_chunk_locations(*file_id) {
-                        for chunk in &chunks {
-                            let _ = state.db.add_free_space(&chunk.store_file, chunk.offset, chunk.length);
-                        }
-                    }
                     if let Ok(Some(thumb_path)) = state.db.get_thumbnail_path(*file_id) {
-                        let thumb_file = std::path::Path::new(&thumb_path);
+                        thumbs_to_delete.push(thumb_path);
+                    }
+                }
+            }
+            // DB删除（含free_space原子记录）
+            match state.db.delete_folder(*id) {
+                Ok(_) => {
+                    for thumb_path in &thumbs_to_delete {
+                        let thumb_file = std::path::Path::new(thumb_path);
                         if thumb_file.exists() {
                             let _ = std::fs::remove_file(thumb_file);
                         }
                     }
+                    success_count += 1;
                 }
-            }
-            match state.db.delete_folder(*id) {
-                Ok(_) => success_count += 1,
                 Err(e) => {
                     fail_count += 1;
                     errors.push(format!("删除文件夹 {} 失败: {}", id, e));
                 }
             }
         } else {
-            if let Ok(Some(thumb_path)) = state.db.get_thumbnail_path(*id) {
-                let thumb_file = std::path::Path::new(&thumb_path);
-                if thumb_file.exists() {
-                    let _ = std::fs::remove_file(thumb_file);
-                }
-            }
-            if let Ok(chunks) = state.db.get_chunk_locations(*id) {
-                for chunk in &chunks {
-                    let _ = state.db.add_free_space(&chunk.store_file, chunk.offset, chunk.length);
-                }
-            }
+            let thumb_path = state.db.get_thumbnail_path(*id).ok().flatten();
             match state.db.delete_file(*id) {
-                Ok(_) => success_count += 1,
+                Ok(_) => {
+                    if let Some(path) = thumb_path {
+                        let thumb_file = std::path::Path::new(&path);
+                        if thumb_file.exists() {
+                            let _ = std::fs::remove_file(thumb_file);
+                        }
+                    }
+                    success_count += 1;
+                }
                 Err(e) => {
                     fail_count += 1;
                     errors.push(format!("删除文件 {} 失败: {}", id, e));

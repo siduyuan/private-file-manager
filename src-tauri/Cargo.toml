@@ -4,10 +4,15 @@ version = "0.1.0"
 description = "Private File Manager"
 authors = ["you"]
 edition = "2021"
+default-run = "private-file-manager"
 
 [lib]
 name = "private_file_manager_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "pfm-repair"
+path = "src/repair.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

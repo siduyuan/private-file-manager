@@ -3,7 +3,6 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::db::Database;
-use crate::models::ChunkLocation;
 
 const MAX_STORE_FILE_SIZE: i64 = 2 * 1024 * 1024 * 1024; // 2GB
 
@@ -38,6 +37,7 @@ pub fn categorize_file(ext: &str, size: i64) -> &'static str {
 }
 
 /// Import a file into the storage system
+/// 原子性保证：先写分片数据到store文件，再在一个事务中提交所有DB记录
 pub fn import_file(
     db: &Database,
     store_dir: &Path,
@@ -83,18 +83,16 @@ pub fn import_file(
         updated_at: now,
     };
 
-    // Insert file record to get file_id
-    let file_id = db
-        .insert_file(&file_info, folder_id)
-        .map_err(|e| format!("DB insert error: {}", e))?;
-
-    // Read source file and write chunks to store files
+    // 阶段1：写分片数据到store文件（不涉及DB写操作）
     let chunk_size = get_chunk_size(file_size);
     let mut source_file =
         File::open(source_path).map_err(|e| format!("Failed to open source: {}", e))?;
 
-    let mut chunks: Vec<ChunkLocation> = Vec::new();
-    let mut chunk_index = 0;
+    // (store_file, offset, length, free_space_id or 0)
+    let mut chunk_data: Vec<(String, i64, i64, i64)> = Vec::new();
+    // (store_file, additional_bytes) for new appends
+    let mut store_file_updates: Vec<(String, i64)> = Vec::new();
+
     let mut remaining = file_size;
 
     while remaining > 0 {
@@ -106,23 +104,25 @@ pub fn import_file(
             .read_exact(&mut buffer)
             .map_err(|e| format!("Read error: {}", e))?;
 
-        // Try to reuse free space first
-        let (store_file_name, current_offset, append_mode) =
-            match db.allocate_free_space(current_chunk_size).map_err(|e| format!("DB free space error: {}", e))? {
-                Some((sf, off)) => {
-                    // Reuse existing free space
-                    (sf, off, false)
+        // 只读查询：优先使用free_space
+        let (store_file_name, current_offset, space_id) =
+            match db.find_free_space(current_chunk_size).map_err(|e| format!("DB free space error: {}", e))? {
+                Some((sid, sf, off)) => {
+                    (sf, off, sid)
                 }
                 None => {
-                    // No free space available, append to end of store file
-                    let store_file_name = db
-                        .get_or_create_store_file(MAX_STORE_FILE_SIZE)
-                        .map_err(|e| format!("DB store file error: {}", e))?;
+                    // 只读查询：查找有空间的store_file
+                    let store_file_name = match db.find_available_store_file(MAX_STORE_FILE_SIZE)
+                        .map_err(|e| format!("DB store file error: {}", e))? {
+                        Some(sf) => sf,
+                        None => db.get_next_store_file_name()
+                            .map_err(|e| format!("DB error: {}", e))?,
+                    };
                     let store_path = store_dir.join(&store_file_name);
                     let current_offset = fs::metadata(&store_path)
                         .map(|m| m.len())
                         .unwrap_or(0);
-                    (store_file_name, current_offset as i64, true)
+                    (store_file_name, current_offset as i64, 0i64)
                 }
             };
 
@@ -130,14 +130,8 @@ pub fn import_file(
 
         // Write chunk to store file
         {
-            let mut store = if append_mode {
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&store_path)
-                    .map_err(|e| format!("Failed to open store file: {}", e))?
-            } else {
-                // Writing to reused free space - need write mode, seek to offset
+            let mut store = if space_id > 0 {
+                // Writing to reused free space
                 let mut f = OpenOptions::new()
                     .write(true)
                     .open(&store_path)
@@ -146,33 +140,37 @@ pub fn import_file(
                 f.seek(SeekFrom::Start(current_offset as u64))
                     .map_err(|e| format!("Seek error: {}", e))?;
                 f
+            } else {
+                // Appending to end of store file
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&store_path)
+                    .map_err(|e| format!("Failed to open store file: {}", e))?
             };
             store
                 .write_all(&buffer)
                 .map_err(|e| format!("Write to store error: {}", e))?;
         }
 
-        chunks.push(ChunkLocation {
-            file_id,
-            chunk_index,
-            store_file: store_file_name.clone(),
-            offset: current_offset,
-            length: current_chunk_size,
-        });
-
-        if append_mode {
-            // Update store file used bytes only for new space
-            db.update_store_file_used(&store_file_name, current_chunk_size)
-                .map_err(|e| format!("DB update store error: {}", e))?;
+        if space_id == 0 {
+            // Track new append for store_files update
+            if let Some(entry) = store_file_updates.iter_mut().find(|(sf, _)| sf == &store_file_name) {
+                entry.1 += current_chunk_size;
+            } else {
+                store_file_updates.push((store_file_name.clone(), current_chunk_size));
+            }
         }
 
+        chunk_data.push((store_file_name, current_offset, current_chunk_size, space_id));
+
         remaining -= current_chunk_size;
-        chunk_index += 1;
     }
 
-    // Insert chunk locations
-    db.insert_chunk_locations(&chunks)
-        .map_err(|e| format!("DB chunk insert error: {}", e))?;
+    // 阶段2：原子提交所有DB记录（文件 + 分片位置 + free_space消耗 + store_files更新）
+    let file_id = db
+        .insert_file_with_chunks(&file_info, folder_id, &chunk_data, &store_file_updates)
+        .map_err(|e| format!("DB insert error: {}", e))?;
 
     Ok(file_id)
 }

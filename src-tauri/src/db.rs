@@ -166,9 +166,19 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
-    pub fn insert_file(&self, file: &FileInfo, folder_id: i64) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+    /// 原子插入文件记录 + 分片位置 + 更新store_files用量 + 消耗free_space
+    /// 所有DB写操作在同一事务中，保证数据一致性
+    pub fn insert_file_with_chunks(
+        &self,
+        file: &FileInfo,
+        folder_id: i64,
+        chunks: &[(String, i64, i64, i64)], // (store_file, offset, length, space_id or 0)
+        store_file_updates: &[(String, i64)], // (store_file, additional_bytes) for new appends
+    ) -> Result<i64> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        tx.execute(
             "INSERT INTO files (name, ext, mime_type, size_bytes, duration_sec,
                                 width, height, category, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -178,26 +188,38 @@ impl Database {
                 file.created_at, file.updated_at
             ],
         )?;
-        let file_id = conn.last_insert_rowid();
-        conn.execute(
+        let file_id = tx.last_insert_rowid();
+
+        tx.execute(
             "INSERT INTO file_folder (file_id, folder_id) VALUES (?, ?)",
             params![file_id, folder_id],
         )?;
-        Ok(file_id)
-    }
 
-    pub fn insert_chunk_locations(&self, chunks: &[ChunkLocation]) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
-        for chunk in chunks {
+        for (i, (store_file, offset, length, _space_id)) in chunks.iter().enumerate() {
             tx.execute(
                 "INSERT INTO chunk_locations (file_id, chunk_index, store_file, offset, length)
                  VALUES (?, ?, ?, ?, ?)",
-                params![chunk.file_id, chunk.chunk_index, chunk.store_file, chunk.offset, chunk.length],
+                params![file_id, i as i32, store_file, offset, length],
             )?;
         }
+
+        // 消耗free_space（从查询阶段收集的space_id）
+        for (_, _, _, space_id) in chunks.iter() {
+            if *space_id > 0 {
+                tx.execute("DELETE FROM free_space WHERE space_id = ?", params![space_id])?;
+            }
+        }
+
+        // 新追加的store_file更新used_bytes
+        for (store_file, additional) in store_file_updates.iter() {
+            tx.execute(
+                "UPDATE store_files SET used_bytes = used_bytes + ? WHERE store_file = ?",
+                params![additional, store_file],
+            )?;
+        }
+
         tx.commit()?;
-        Ok(())
+        Ok(file_id)
     }
 
     pub fn get_chunk_locations(&self, file_id: i64) -> Result<Vec<ChunkLocation>> {
@@ -218,37 +240,24 @@ impl Database {
         Ok(chunks)
     }
 
-    pub fn get_or_create_store_file(&self, max_size: i64) -> Result<String> {
+    /// 只读查询：查找可用store_file（不创建新记录）
+    pub fn find_available_store_file(&self, max_size: i64) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
-        let existing: Option<String> = conn.query_row(
+        let result: Option<String> = conn.query_row(
             "SELECT store_file FROM store_files WHERE used_bytes < ? ORDER BY store_file LIMIT 1",
             params![max_size],
             |row| row.get(0),
         ).ok();
-
-        if let Some(sf) = existing {
-            Ok(sf)
-        } else {
-            // Get next store file number
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM store_files", [], |row| row.get(0),
-            )?;
-            let store_file = format!("store_{:03}.bin", count + 1);
-            conn.execute(
-                "INSERT INTO store_files (store_file, used_bytes) VALUES (?, 0)",
-                params![&store_file],
-            )?;
-            Ok(store_file)
-        }
+        Ok(result)
     }
 
-    pub fn update_store_file_used(&self, store_file: &str, additional_bytes: i64) -> Result<()> {
+    /// 只读查询：获取下一个store_file名称
+    pub fn get_next_store_file_name(&self) -> Result<String> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE store_files SET used_bytes = used_bytes + ? WHERE store_file = ?",
-            params![additional_bytes, store_file],
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM store_files", [], |row| row.get(0),
         )?;
-        Ok(())
+        Ok(format!("store_{:03}.bin", count + 1))
     }
 
     pub fn delete_file(&self, file_id: i64) -> Result<Vec<ChunkLocation>> {
@@ -273,16 +282,98 @@ impl Database {
         tx.execute("DELETE FROM thumbnail_index WHERE file_id = ?", params![file_id])?;
         tx.execute("DELETE FROM file_folder WHERE file_id = ?", params![file_id])?;
         tx.execute("DELETE FROM files WHERE file_id = ?", params![file_id])?;
+        // 原子记录free_space，避免崩溃导致空间泄漏
+        for chunk in &chunks {
+            tx.execute(
+                "INSERT INTO free_space (store_file, offset, length) VALUES (?, ?, ?)",
+                params![chunk.store_file, chunk.offset, chunk.length],
+            )?;
+        }
         tx.commit()?;
         Ok(chunks)
     }
 
-    pub fn delete_folder(&self, folder_id: i64) -> Result<()> {
+    pub fn delete_folder(&self, folder_id: i64) -> Result<Vec<ChunkLocation>> {
         let mut conn = self.conn.lock().unwrap();
+        
+        // 先查询所有需要释放的分片位置
+        let mut stmt = conn.prepare(
+            "SELECT cl.file_id, cl.chunk_index, cl.store_file, cl.offset, cl.length
+             FROM chunk_locations cl
+             JOIN file_folder ff ON cl.file_id = ff.file_id
+             WHERE ff.folder_id IN (
+                 WITH RECURSIVE subfolders AS (
+                     SELECT folder_id FROM folders WHERE folder_id = ?
+                     UNION ALL
+                     SELECT f.folder_id FROM folders f
+                     JOIN subfolders s ON f.parent_id = s.folder_id
+                 )
+                 SELECT folder_id FROM subfolders
+             )
+             ORDER BY cl.file_id, cl.chunk_index"
+        )?;
+        let all_chunks = stmt.query_map(params![folder_id], |row| {
+            Ok(ChunkLocation {
+                file_id: row.get(0)?,
+                chunk_index: row.get(1)?,
+                store_file: row.get(2)?,
+                offset: row.get(3)?,
+                length: row.get(4)?,
+            })
+        })?.collect::<Result<Vec<_>>>()?;
+        drop(stmt);
+        
         let tx = conn.transaction()?;
         
-        // 递归删除文件夹及其所有子文件夹
-        // 先删除所有子文件夹中的文件关联
+        // 1. 删除所有子文件夹中文件的缩略图索引
+        tx.execute(
+            "DELETE FROM thumbnail_index WHERE file_id IN (
+                SELECT file_id FROM file_folder WHERE folder_id IN (
+                    WITH RECURSIVE subfolders AS (
+                        SELECT folder_id FROM folders WHERE folder_id = ?
+                        UNION ALL
+                        SELECT f.folder_id FROM folders f
+                        JOIN subfolders s ON f.parent_id = s.folder_id
+                    )
+                    SELECT folder_id FROM subfolders
+                )
+            )",
+            params![folder_id],
+        )?;
+        
+        // 2. 删除所有子文件夹中文件的chunk位置记录
+        tx.execute(
+            "DELETE FROM chunk_locations WHERE file_id IN (
+                SELECT file_id FROM file_folder WHERE folder_id IN (
+                    WITH RECURSIVE subfolders AS (
+                        SELECT folder_id FROM folders WHERE folder_id = ?
+                        UNION ALL
+                        SELECT f.folder_id FROM folders f
+                        JOIN subfolders s ON f.parent_id = s.folder_id
+                    )
+                    SELECT folder_id FROM subfolders
+                )
+            )",
+            params![folder_id],
+        )?;
+        
+        // 3. 删除所有子文件夹中的文件记录
+        tx.execute(
+            "DELETE FROM files WHERE file_id IN (
+                SELECT file_id FROM file_folder WHERE folder_id IN (
+                    WITH RECURSIVE subfolders AS (
+                        SELECT folder_id FROM folders WHERE folder_id = ?
+                        UNION ALL
+                        SELECT f.folder_id FROM folders f
+                        JOIN subfolders s ON f.parent_id = s.folder_id
+                    )
+                    SELECT folder_id FROM subfolders
+                )
+            )",
+            params![folder_id],
+        )?;
+        
+        // 4. 删除所有子文件夹的文件关联
         tx.execute(
             "DELETE FROM file_folder WHERE folder_id IN (
                 WITH RECURSIVE subfolders AS (
@@ -296,7 +387,7 @@ impl Database {
             params![folder_id],
         )?;
         
-        // 删除所有子文件夹
+        // 5. 删除所有子文件夹
         tx.execute(
             "DELETE FROM folders WHERE folder_id IN (
                 WITH RECURSIVE subfolders AS (
@@ -310,8 +401,16 @@ impl Database {
             params![folder_id],
         )?;
         
+        // 6. 原子记录free_space，避免崩溃导致空间泄漏
+        for chunk in &all_chunks {
+            tx.execute(
+                "INSERT INTO free_space (store_file, offset, length) VALUES (?, ?, ?)",
+                params![chunk.store_file, chunk.offset, chunk.length],
+            )?;
+        }
+        
         tx.commit()?;
-        Ok(())
+        Ok(all_chunks)
     }
 
     pub fn get_all_file_ids_in_folder_recursive(&self, folder_id: i64) -> Result<Vec<i64>> {
@@ -523,52 +622,17 @@ impl Database {
         Ok(files)
     }
 
-    /// Record freed space for later reuse
-    pub fn add_free_space(&self, store_file: &str, offset: i64, length: i64) -> Result<()> {
+    /// 只读查询：查找可用free_space（不修改DB）
+    /// 返回 (space_id, store_file, offset)
+    /// space_id=0 表示无可用空间
+    pub fn find_free_space(&self, needed: i64) -> Result<Option<(i64, String, i64)>> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO free_space (store_file, offset, length) VALUES (?, ?, ?)",
-            params![store_file, offset, length],
-        )?;
-        Ok(())
-    }
-
-    /// Find and allocate free space for a chunk. Returns Some((store_file, offset)) if found, None otherwise.
-    /// Uses best-fit strategy: finds the smallest free block >= needed size.
-    pub fn allocate_free_space(&self, needed: i64) -> Result<Option<(String, i64)>> {
-        let conn = self.conn.lock().unwrap();
-        // Find best-fit free space (smallest block >= needed)
         let result: Option<(i64, String, i64)> = conn.query_row(
             "SELECT space_id, store_file, offset FROM free_space
              WHERE length >= ? ORDER BY length ASC LIMIT 1",
             params![needed],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).ok();
-
-        if let Some((space_id, store_file, offset)) = result {
-            let remaining = {
-                let block_len: i64 = conn.query_row(
-                    "SELECT length FROM free_space WHERE space_id = ?",
-                    params![space_id],
-                    |row| row.get(0),
-                )?;
-                block_len - needed
-            };
-
-            if remaining > 0 {
-                // Shrink the free block
-                conn.execute(
-                    "UPDATE free_space SET offset = offset + ?, length = ? WHERE space_id = ?",
-                    params![needed, remaining, space_id],
-                )?;
-            } else {
-                // Use the entire block
-                conn.execute("DELETE FROM free_space WHERE space_id = ?", params![space_id])?;
-            }
-
-            Ok(Some((store_file, offset)))
-        } else {
-            Ok(None)
-        }
+        Ok(result)
     }
 }
