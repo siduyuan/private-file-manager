@@ -39,3 +39,33 @@ pub struct ImportResult {
     pub fail_count: i32,
     pub errors: Vec<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FolderContentsItem {
+    pub id: i64,
+    pub name: String,
+    pub is_folder: bool,
+    pub size_bytes: i64,
+    pub category: Option<String>,
+    pub ext: Option<String>,
+    pub thumbnail_path: Option<String>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FolderContents {
+    pub items: Vec<FolderContentsItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BreadcrumbItem {
+    pub id: i64,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchResult {
+    pub success_count: i32,
+    pub fail_count: i32,
+    pub errors: Vec<String>,
+}

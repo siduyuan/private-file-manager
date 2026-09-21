@@ -62,6 +62,32 @@ interface ImportResult {
   errors: string[];
 }
 
+interface FolderContentsItem {
+  id: number;
+  name: string;
+  is_folder: boolean;
+  size_bytes: number;
+  category: string | null;
+  ext: string | null;
+  thumbnail_path: string | null;
+  updated_at: number;
+}
+
+interface FolderContents {
+  items: FolderContentsItem[];
+}
+
+interface BreadcrumbItem {
+  id: number;
+  name: string;
+}
+
+interface BatchResult {
+  success_count: number;
+  fail_count: number;
+  errors: string[];
+}
+
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return bytes + ' B';
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
@@ -174,7 +200,7 @@ function getFileIcon(category: string | null, ext?: string | null) {
 
 function App() {
   const [folders, setFolders] = useState<FolderInfo[]>([]);
-  const [files, setFiles] = useState<FileInfo[]>([]);
+  const [items, setItems] = useState<FolderContentsItem[]>([]);
   const [currentFolderId, setCurrentFolderId] = useState<number>(1);
   const [selectedFileIds, setSelectedFileIds] = useState<number[]>([]);
   const [searchKeyword, setSearchKeyword] = useState('');
@@ -189,7 +215,8 @@ function App() {
   const [newFolderModalOpen, setNewFolderModalOpen] = useState(false);
   const [newFolderName, setNewFolderName] = useState('');
   const [expandedKeys, setExpandedKeys] = useState<React.Key[]>([1]); // 默认展开根目录
-  const [currentFolders, setCurrentFolders] = useState<FolderInfo[]>([]); // 当前目录下的子文件夹
+  const currentFolders = items.filter(i => i.is_folder);
+  const files = items.filter(i => !i.is_folder);
 
   // 单击停顿再单击 = 重命名（用 ref 避免闭包陈旧值问题）
   const lastClickTimeRef = useRef<number>(0);
@@ -224,26 +251,23 @@ function App() {
     }
   }, []);
 
-  const loadFiles = useCallback(async (folderId: number) => {
+  const loadFolderContents = useCallback(async (folderId: number) => {
     setLoading(true);
     try {
-      const result = await invoke<FileInfo[]>('get_files_in_folder', { folderId });
-      setFiles(result);
-      // 同时获取当前目录下的子文件夹
-      const subFolders = folders.filter(f => f.parent_id === folderId);
-      setCurrentFolders(subFolders);
+      const result = await invoke<FolderContents>('get_folder_contents', { folderId });
+      setItems(result.items);
     } catch (e) {
-      console.error('Failed to load files:', e);
-      message.error('加载文件失败');
+      console.error('Failed to load folder contents:', e);
+      message.error('加载失败');
     } finally {
       setLoading(false);
     }
-  }, [folders]);
+  }, []);
 
   useEffect(() => {
     loadFolders();
-    loadFiles(currentFolderId);
-  }, [currentFolderId, loadFolders, loadFiles]);
+    loadFolderContents(currentFolderId);
+  }, [currentFolderId, loadFolders, loadFolderContents]);
 
   // 全局鼠标事件监听，确保拖拽和选择框在鼠标移出内容区域后仍能工作
   useEffect(() => {
@@ -273,27 +297,18 @@ function App() {
       if (isCustomDragging) {
         if (sidebarHoverFolderId !== null) {
           const ids = customDragIdsRef.current;
-          let successCount = 0;
-          ids.forEach(id => {
-            if (id > 0) {
-              invoke('move_file', { fileId: id, targetFolderId: sidebarHoverFolderId })
-                .then(() => { successCount++; })
-                .catch(err => message.error('移动失败: ' + err));
-            } else {
-              const folderId = -id;
-              if (folderId !== sidebarHoverFolderId) {
-                invoke('move_folder', { folderId, targetParentId: sidebarHoverFolderId })
-                  .then(() => { successCount++; })
-                  .catch(err => message.error('移动失败: ' + err));
-              }
-            }
-          });
-          if (successCount > 0) {
-            setTimeout(() => {
-              message.success(`成功移动 ${successCount} 个项目`);
-              loadFiles(currentFolderId);
-              loadFolders();
-            }, 100);
+          if (ids.length > 0) {
+            invoke<BatchResult>('batch_move', { ids, targetFolderId: sidebarHoverFolderId })
+              .then(result => {
+                if (result.fail_count > 0) {
+                  message.warning(`移动完成：成功 ${result.success_count} 个，失败 ${result.fail_count} 个`);
+                } else {
+                  message.success(`成功移动 ${result.success_count} 个项目`);
+                }
+                loadFolderContents(currentFolderId);
+                loadFolders();
+              })
+              .catch(err => message.error('移动失败: ' + err));
           }
         }
         setIsCustomDragging(false);
@@ -345,20 +360,19 @@ function App() {
   };
 
   // 进入文件夹
-  const enterFolder = (folderId: number) => {
+  const enterFolder = async (folderId: number) => {
     setCurrentFolderId(folderId);
     setSelectedFileIds([]);
     setSearchKeyword('');
     setExpandedKeys(prev => prev.includes(folderId) ? prev : [...prev, folderId]);
 
-    // Build breadcrumb path
-    const path: { id: number; name: string }[] = [];
-    let current = folders.find(f => f.folder_id === folderId);
-    while (current) {
-      path.unshift({ id: current.folder_id, name: current.name });
-      current = current.parent_id ? folders.find(f => f.folder_id === current!.parent_id) : undefined;
+    // 后端负责面包屑路径构建
+    try {
+      const path = await invoke<BreadcrumbItem[]>('get_breadcrumb_path', { folderId });
+      setBreadcrumb(path);
+    } catch (e) {
+      console.error('Failed to load breadcrumb:', e);
     }
-    setBreadcrumb(path);
   };
 
   const handleImportFiles = async () => {
@@ -378,7 +392,7 @@ function App() {
         } else {
           message.success(`成功导入 ${result.success_count} 个文件`);
         }
-        loadFiles(currentFolderId);
+        loadFolderContents(currentFolderId);
         loadFolders();
       }
     } catch (e) {
@@ -410,7 +424,7 @@ function App() {
         }
         // Refresh both files and folders
         await loadFolders();
-        await loadFiles(currentFolderId);
+        await loadFolderContents(currentFolderId);
       }
     } catch (e) {
       console.error('Import failed:', e);
@@ -430,19 +444,11 @@ function App() {
       });
       if (targetDir) {
         const dir = Array.isArray(targetDir) ? targetDir[0] : targetDir;
-        // 区分文件和文件夹
-        const folderIds = currentFolders
-          .filter(f => selectedFileIds.includes(f.folder_id))
-          .map(f => f.folder_id);
-        const fileIds = selectedFileIds.filter(id => !folderIds.includes(id));
-        
-        await invoke<string[]>('export_files', {
-          fileIds: fileIds,
-          folderIds: folderIds,
+        await invoke<string[]>('batch_export', {
+          ids: selectedFileIds,
           targetDir: dir,
         });
-        const totalCount = fileIds.length + folderIds.length;
-        message.success(`成功导出 ${totalCount} 个项目`);
+        message.success(`成功导出 ${selectedFileIds.length} 个项目`);
       }
     } catch (e) {
       message.error('导出失败: ' + e);
@@ -452,27 +458,15 @@ function App() {
   const handleDelete = async (ids?: number[]) => {
     const targetIds = ids || selectedFileIds;
     if (targetIds.length === 0) return;
-    
-    // 区分文件和文件夹
-    const folderIds = currentFolders
-      .filter(f => targetIds.includes(f.folder_id))
-      .map(f => f.folder_id);
-    const fileIds = targetIds.filter(id => !folderIds.includes(id));
-    
     try {
-      // 删除文件夹
-      for (const id of folderIds) {
-        await invoke('delete_folder', { folderId: id });
+      const result = await invoke<BatchResult>('batch_delete', { ids: targetIds });
+      if (result.fail_count > 0) {
+        message.warning(`删除完成：成功 ${result.success_count} 个，失败 ${result.fail_count} 个`);
+      } else {
+        message.success(`已删除 ${result.success_count} 个项目`);
       }
-      // 删除文件
-      for (const id of fileIds) {
-        await invoke('delete_file', { fileId: id });
-      }
-      
-      const totalCount = folderIds.length + fileIds.length;
-      message.success(`已删除 ${totalCount} 个项目`);
       setSelectedFileIds([]);
-      loadFiles(currentFolderId);
+      loadFolderContents(currentFolderId);
       loadFolders();
     } catch (e) {
       message.error('删除失败: ' + e);
@@ -489,13 +483,22 @@ function App() {
 
   const handleSearch = async () => {
     if (!searchKeyword.trim()) {
-      loadFiles(currentFolderId);
+      loadFolderContents(currentFolderId);
       return;
     }
     setLoading(true);
     try {
       const result = await invoke<FileInfo[]>('search_files', { keyword: searchKeyword });
-      setFiles(result);
+      setItems(result.map(f => ({
+        id: f.file_id,
+        name: f.name,
+        is_folder: false,
+        size_bytes: f.size_bytes,
+        category: f.category,
+        ext: f.ext,
+        thumbnail_path: f.thumbnail_path,
+        updated_at: f.updated_at,
+      })));
     } catch (e) {
       console.error('Search failed:', e);
     } finally {
@@ -526,7 +529,7 @@ function App() {
       setRenameModalOpen(false);
       setRenameValue('');
       setRenameFileId(null);
-      loadFiles(currentFolderId);
+      loadFolderContents(currentFolderId);
       message.success('重命名成功');
     } catch (e) {
       message.error('重命名失败: ' + e);
@@ -570,7 +573,7 @@ function App() {
         await invoke('rename_folder', { folderId: -inlineRenameId, newName: inlineRenameValue });
       }
       message.success('重命名成功');
-      loadFiles(currentFolderId);
+      loadFolderContents(currentFolderId);
       loadFolders();
     } catch (e) {
       message.error('重命名失败: ' + e);
@@ -592,7 +595,7 @@ function App() {
       if (selectedFileIds.includes(id)) {
         mouseDownInfoRef.current = { x: e.clientX, y: e.clientY, target: gridItem, isGridItem: true, isFileRow: false };
         customDragIdsRef.current = selectedFileIds.map(sid => {
-          const f = currentFolders.find(cf => cf.folder_id === sid);
+          const f = currentFolders.find(cf => cf.id === sid);
           return f ? -sid : sid;
         });
       }
@@ -602,7 +605,7 @@ function App() {
       if (selectedFileIds.includes(id)) {
         mouseDownInfoRef.current = { x: e.clientX, y: e.clientY, target: fileRow, isGridItem: false, isFileRow: true };
         customDragIdsRef.current = selectedFileIds.map(sid => {
-          const f = currentFolders.find(cf => cf.folder_id === sid);
+          const f = currentFolders.find(cf => cf.id === sid);
           return f ? -sid : sid;
         });
       }
@@ -707,27 +710,18 @@ function App() {
     if (isCustomDragging) {
       if (sidebarHoverFolderId !== null) {
         const ids = customDragIdsRef.current;
-        let successCount = 0;
-        ids.forEach(id => {
-          if (id > 0) {
-            invoke('move_file', { fileId: id, targetFolderId: sidebarHoverFolderId })
-              .then(() => { successCount++; })
-              .catch(err => message.error('移动失败: ' + err));
-          } else {
-            const folderId = -id;
-            if (folderId !== sidebarHoverFolderId) {
-              invoke('move_folder', { folderId, targetParentId: sidebarHoverFolderId })
-                .then(() => { successCount++; })
-                .catch(err => message.error('移动失败: ' + err));
-            }
-          }
-        });
-        if (successCount > 0) {
-          setTimeout(() => {
-            message.success(`成功移动 ${successCount} 个项目`);
-            loadFiles(currentFolderId);
-            loadFolders();
-          }, 100);
+        if (ids.length > 0) {
+          invoke<BatchResult>('batch_move', { ids, targetFolderId: sidebarHoverFolderId })
+            .then(result => {
+              if (result.fail_count > 0) {
+                message.warning(`移动完成：成功 ${result.success_count} 个，失败 ${result.fail_count} 个`);
+              } else {
+                message.success(`成功移动 ${result.success_count} 个项目`);
+              }
+              loadFolderContents(currentFolderId);
+              loadFolders();
+            })
+            .catch(err => message.error('移动失败: ' + err));
         }
       }
       setIsCustomDragging(false);
@@ -863,7 +857,7 @@ function App() {
             <Button icon={<FolderAddOutlined />} onClick={() => setNewFolderModalOpen(true)}>新建文件夹</Button>
           </Tooltip>
           <Tooltip title="刷新">
-            <Button icon={<ReloadOutlined />} onClick={() => loadFiles(currentFolderId)} />
+            <Button icon={<ReloadOutlined />} onClick={() => loadFolderContents(currentFolderId)} />
           </Tooltip>
         </Space>
         <Space>
@@ -940,28 +934,24 @@ function App() {
               onKeyDown={(e) => {
                 if (e.ctrlKey && e.key === 'a') {
                   e.preventDefault();
-                  const allIds = [
-                    ...currentFolders.map(f => f.folder_id),
-                    ...files.map(f => f.file_id),
-                  ];
+                  const allIds = items.map(i => i.id);
                   setSelectedFileIds(allIds);
                 }
               }}
               style={{ outline: 'none', height: '100%', overflow: 'auto', cursor: 'default', position: 'relative' }}
             >
               <Table
-                dataSource={[
-                  ...currentFolders.map(f => ({
-                    key: `folder-${f.folder_id}`,
-                    file_id: f.folder_id,
-                    name: f.name,
-                    size_bytes: 0,
-                    category: 'folder',
-                    updated_at: f.created_at,
-                    isFolder: true,
-                  })),
-                  ...files.map(f => ({ ...f, isFolder: false })),
-                ]}
+                dataSource={items.map(item => ({
+                  key: item.is_folder ? `folder-${item.id}` : `file-${item.id}`,
+                  file_id: item.id,
+                  name: item.name,
+                  size_bytes: item.size_bytes,
+                  category: item.is_folder ? 'folder' : item.category,
+                  ext: item.ext,
+                  thumbnail_path: item.thumbnail_path,
+                  updated_at: item.updated_at,
+                  isFolder: item.is_folder,
+                }))}
                 columns={[
                   {
                     title: '',
@@ -1036,7 +1026,7 @@ function App() {
                       if (row) {
                         mouseDownInfoRef.current = { x: e.clientX, y: e.clientY, target: row, isGridItem: false, isFileRow: true };
                         customDragIdsRef.current = selectedFileIds.map(sid => {
-                          const f = currentFolders.find(cf => cf.folder_id === sid);
+                          const f = currentFolders.find(cf => cf.id === sid);
                           return f ? -sid : sid;
                         });
                       }
@@ -1096,10 +1086,7 @@ function App() {
                 // Ctrl+A 全选
                 if (e.ctrlKey && e.key === 'a') {
                   e.preventDefault();
-                  const allIds = [
-                    ...currentFolders.map(f => f.folder_id),
-                    ...files.map(f => f.file_id),
-                  ];
+                  const allIds = items.map(i => i.id);
                   setSelectedFileIds(allIds);
                 }
               }}
@@ -1116,151 +1103,114 @@ function App() {
                 setContextMenuPos(null);
               }}
             >
-              {/* 文件夹 */}
-              {currentFolders.map(folder => (
+              {items.map(item => (
                 <Dropdown
-                  key={`folder-${folder.folder_id}`}
+                  key={item.is_folder ? `folder-${item.id}` : `file-${item.id}`}
                   menu={{ items: getContextMenuItems({
-                    file_id: folder.folder_id,
-                    name: folder.name,
-                    category: 'folder',
-                    size_bytes: 0,
-                    ext: null,
+                    file_id: item.id,
+                    name: item.name,
+                    category: item.is_folder ? 'folder' : item.category,
+                    size_bytes: item.size_bytes,
+                    ext: item.ext,
                     mime_type: null,
                     duration_sec: null,
                     width: null,
                     height: null,
-                    thumbnail_path: null,
-                    created_at: folder.created_at,
-                    updated_at: folder.created_at,
+                    thumbnail_path: item.thumbnail_path,
+                    created_at: item.updated_at,
+                    updated_at: item.updated_at,
                   } as FileInfo) }}
                   trigger={['contextMenu']}
                 >
                 <div
-                  className={`grid-item ${selectedFileIds.includes(folder.folder_id) ? 'grid-item-selected' : ''}`}
-                  data-id={folder.folder_id}
-                  data-type="folder"
+                  className={`grid-item ${selectedFileIds.includes(item.id) ? 'grid-item-selected' : ''}`}
+                  data-id={item.id}
+                  data-type={item.is_folder ? 'folder' : 'file'}
                   style={{
                     width: 120,
                     padding: 8,
                     textAlign: 'center',
                     borderRadius: 4,
-                    border: selectedFileIds.includes(folder.folder_id) ? '2px solid #1890ff' : '1px solid #f0f0f0',
+                    border: selectedFileIds.includes(item.id) ? '2px solid #1890ff' : '1px solid #f0f0f0',
                   }}
                   onClick={(e) => {
                     e.stopPropagation();
                     if (e.ctrlKey) {
                       setSelectedFileIds(prev =>
-                        prev.includes(folder.folder_id)
-                          ? prev.filter(id => id !== folder.folder_id)
-                          : [...prev, folder.folder_id]
+                        prev.includes(item.id)
+                          ? prev.filter(id => id !== item.id)
+                          : [...prev, item.id]
                       );
                     } else {
-                      setSelectedFileIds([folder.folder_id]);
-                      handleClickForRename(-folder.folder_id, folder.name);
+                      setSelectedFileIds([item.id]);
+                      handleClickForRename(item.is_folder ? -item.id : item.id, item.name);
                     }
                   }}
-                  onDoubleClick={() => { setInlineRenameId(null); enterFolder(folder.folder_id); }}
+                  onDoubleClick={() => {
+                    setInlineRenameId(null);
+                    if (item.is_folder) {
+                      enterFolder(item.id);
+                    } else {
+                      handleOpenFile(item.id);
+                    }
+                  }}
                 >
-                  <div style={{ fontSize: 40, marginBottom: 4 }}>
-                    <FolderOutlined style={{ color: '#faad14' }} />
-                  </div>
-                  <div style={{
-                    fontSize: 12,
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                    whiteSpace: 'nowrap',
-                  }}>
-                    {inlineRenameId === -folder.folder_id ? (
-                      <Input
-                        size="small"
-                        value={inlineRenameValue}
-                        onChange={e => setInlineRenameValue(e.target.value)}
-                        onBlur={handleInlineRenameSubmit}
-                        onPressEnter={handleInlineRenameSubmit}
-                        onKeyDown={e => { if (e.key === 'Escape') setInlineRenameId(null); }}
-                        autoFocus
-                        onClick={e => e.stopPropagation()}
-                        style={{ fontSize: 12, padding: '0 4px' }}
-                      />
-                    ) : folder.name}
-                  </div>
-                  <div style={{ fontSize: 11, color: '#999' }}>
-                    文件夹
-                  </div>
+                  {item.is_folder ? (
+                    <>
+                      <div style={{ fontSize: 40, marginBottom: 4 }}>
+                        <FolderOutlined style={{ color: '#faad14' }} />
+                      </div>
+                      <div style={{ fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {inlineRenameId === -item.id ? (
+                          <Input
+                            size="small"
+                            value={inlineRenameValue}
+                            onChange={e => setInlineRenameValue(e.target.value)}
+                            onBlur={handleInlineRenameSubmit}
+                            onPressEnter={handleInlineRenameSubmit}
+                            onKeyDown={e => { if (e.key === 'Escape') setInlineRenameId(null); }}
+                            autoFocus
+                            onClick={e => e.stopPropagation()}
+                            style={{ fontSize: 12, padding: '0 4px' }}
+                          />
+                        ) : item.name}
+                      </div>
+                      <div style={{ fontSize: 11, color: '#999' }}>文件夹</div>
+                    </>
+                  ) : (
+                    <>
+                      <div style={{ width: 80, height: 80, marginBottom: 4, display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}>
+                        {item.thumbnail_path ? (
+                          <img
+                            src={convertFileSrc(item.thumbnail_path)}
+                            alt={item.name}
+                            style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                          />
+                        ) : (
+                          <div style={{ fontSize: 40, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                            {getFileIcon(item.category, item.ext)}
+                          </div>
+                        )}
+                      </div>
+                      <div style={{ fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {inlineRenameId === item.id ? (
+                          <Input
+                            size="small"
+                            value={inlineRenameValue}
+                            onChange={e => setInlineRenameValue(e.target.value)}
+                            onBlur={handleInlineRenameSubmit}
+                            onPressEnter={handleInlineRenameSubmit}
+                            onKeyDown={e => { if (e.key === 'Escape') setInlineRenameId(null); }}
+                            autoFocus
+                            onClick={e => e.stopPropagation()}
+                            style={{ fontSize: 12, padding: '0 4px' }}
+                          />
+                        ) : item.name}
+                      </div>
+                      <div style={{ fontSize: 11, color: '#999' }}>{formatFileSize(item.size_bytes)}</div>
+                    </>
+                  )}
                 </div>
-                </Dropdown>
-              ))}
-              {/* 文件 */}
-              {files.map(file => (
-                <Dropdown
-                  key={file.file_id}
-                  menu={{ items: getContextMenuItems(file) }}
-                  trigger={['contextMenu']}
-                >
-                  <div
-                    className={`grid-item ${selectedFileIds.includes(file.file_id) ? 'grid-item-selected' : ''}`}
-                    data-id={file.file_id}
-                    data-type="file"
-                    style={{
-                      width: 120,
-                      padding: 8,
-                      textAlign: 'center',
-                      borderRadius: 4,
-                      border: selectedFileIds.includes(file.file_id) ? '2px solid #1890ff' : '1px solid #f0f0f0',
-                    }}
-                    onDoubleClick={() => { setInlineRenameId(null); handleOpenFile(file.file_id); }}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      if (e.ctrlKey) {
-                        setSelectedFileIds(prev =>
-                          prev.includes(file.file_id)
-                            ? prev.filter(id => id !== file.file_id)
-                            : [...prev, file.file_id]
-                        );
-                      } else {
-                        setSelectedFileIds([file.file_id]);
-                        handleClickForRename(file.file_id, file.name);
-                      }
-                    }}
-                  >
-                    <div style={{ width: 80, height: 80, marginBottom: 4, display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}>
-                      {file.thumbnail_path ? (
-                        <img
-                          src={convertFileSrc(file.thumbnail_path)}
-                          alt={file.name}
-                          style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-                        />
-                      ) : (
-                        <div style={{ fontSize: 40, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                          {getFileIcon(file.category, file.ext)}
-                        </div>
-                      )}
-                    </div>
-                    <div style={{
-                      fontSize: 12,
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis',
-                      whiteSpace: 'nowrap',
-                    }}>
-                      {inlineRenameId === file.file_id ? (
-                        <Input
-                          size="small"
-                          value={inlineRenameValue}
-                          onChange={e => setInlineRenameValue(e.target.value)}
-                          onBlur={handleInlineRenameSubmit}
-                          onPressEnter={handleInlineRenameSubmit}
-                          onKeyDown={e => { if (e.key === 'Escape') setInlineRenameId(null); }}
-                          autoFocus
-                          onClick={e => e.stopPropagation()}
-                          style={{ fontSize: 12, padding: '0 4px' }}
-                        />
-                      ) : file.name}
-                    </div>
-                    <div style={{ fontSize: 11, color: '#999' }}>
-                      {formatFileSize(file.size_bytes)}
-                    </div>
-                  </div>
                 </Dropdown>
               ))}
               {/* 拖拽选择框 */}
@@ -1327,7 +1277,7 @@ function App() {
 
       {/* Status Bar */}
       <Layout.Footer style={{ height: 28, padding: '0 16px', background: '#fafafa', borderTop: '1px solid #f0f0f0', display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 12, color: '#666', lineHeight: '28px' }}>
-        <span>{files.length} 个文件</span>
+        <span>{files.length} 个文件{currentFolders.length > 0 ? `, ${currentFolders.length} 个文件夹` : ''}</span>
         <span>
           {selectedFileIds.length > 0 && `已选择 ${selectedFileIds.length} 个 | `}
           总大小: {formatFileSize(files.reduce((sum, f) => sum + f.size_bytes, 0))}

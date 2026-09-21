@@ -504,6 +504,233 @@ fn list_dir(dir_path: String) -> Result<Vec<DirEntry>, String> {
     Ok(entries)
 }
 
+// ==================== 前后端分离命令 ====================
+
+/// 获取文件夹完整内容（子文件夹 + 文件），前端无需做任何合并
+#[tauri::command]
+fn get_folder_contents(
+    state: tauri::State<Mutex<AppState>>,
+    folder_id: i64,
+) -> Result<FolderContents, String> {
+    let state = state.lock().unwrap();
+    let all_folders = state.db.get_folders().map_err(|e| e.to_string())?;
+    let files = state.db.get_files_in_folder(folder_id).map_err(|e| e.to_string())?;
+
+    let mut items: Vec<FolderContentsItem> = Vec::new();
+
+    // 子文件夹
+    for f in &all_folders {
+        if f.parent_id == Some(folder_id) {
+            items.push(FolderContentsItem {
+                id: f.folder_id,
+                name: f.name.clone(),
+                is_folder: true,
+                size_bytes: 0,
+                category: None,
+                ext: None,
+                thumbnail_path: None,
+                updated_at: f.created_at,
+            });
+        }
+    }
+
+    // 文件
+    for file in &files {
+        items.push(FolderContentsItem {
+            id: file.file_id,
+            name: file.name.clone(),
+            is_folder: false,
+            size_bytes: file.size_bytes,
+            category: file.category.clone(),
+            ext: file.ext.clone(),
+            thumbnail_path: file.thumbnail_path.clone(),
+            updated_at: file.updated_at,
+        });
+    }
+
+    Ok(FolderContents { items })
+}
+
+/// 获取面包屑路径，后端负责路径拼装
+#[tauri::command]
+fn get_breadcrumb_path(
+    state: tauri::State<Mutex<AppState>>,
+    folder_id: i64,
+) -> Result<Vec<BreadcrumbItem>, String> {
+    let state = state.lock().unwrap();
+    let all_folders = state.db.get_folders().map_err(|e| e.to_string())?;
+
+    let mut path = Vec::new();
+    let mut current = all_folders.iter().find(|f| f.folder_id == folder_id);
+    while let Some(f) = current {
+        path.push(BreadcrumbItem {
+            id: f.folder_id,
+            name: f.name.clone(),
+        });
+        current = f.parent_id.and_then(|pid| all_folders.iter().find(|f| f.folder_id == pid));
+    }
+    path.reverse();
+    Ok(path)
+}
+
+/// 批量删除（混合文件和文件夹ID），后端负责类型判断
+#[tauri::command]
+fn batch_delete(
+    state: tauri::State<Mutex<AppState>>,
+    ids: Vec<i64>,
+) -> Result<BatchResult, String> {
+    let state = state.lock().unwrap();
+    let all_folders = state.db.get_folders().map_err(|e| e.to_string())?;
+    let mut success_count = 0;
+    let mut fail_count = 0;
+    let mut errors = Vec::new();
+
+    for id in &ids {
+        let is_folder = all_folders.iter().any(|f| f.folder_id == *id);
+        if is_folder {
+            // 收集文件夹递归下的所有文件信息
+            if let Ok(file_ids) = state.db.get_all_file_ids_in_folder_recursive(*id) {
+                for file_id in &file_ids {
+                    if let Ok(chunks) = state.db.get_chunk_locations(*file_id) {
+                        for chunk in &chunks {
+                            let _ = state.db.add_free_space(&chunk.store_file, chunk.offset, chunk.length);
+                        }
+                    }
+                    if let Ok(Some(thumb_path)) = state.db.get_thumbnail_path(*file_id) {
+                        let thumb_file = std::path::Path::new(&thumb_path);
+                        if thumb_file.exists() {
+                            let _ = std::fs::remove_file(thumb_file);
+                        }
+                    }
+                }
+            }
+            match state.db.delete_folder(*id) {
+                Ok(_) => success_count += 1,
+                Err(e) => {
+                    fail_count += 1;
+                    errors.push(format!("删除文件夹 {} 失败: {}", id, e));
+                }
+            }
+        } else {
+            if let Ok(Some(thumb_path)) = state.db.get_thumbnail_path(*id) {
+                let thumb_file = std::path::Path::new(&thumb_path);
+                if thumb_file.exists() {
+                    let _ = std::fs::remove_file(thumb_file);
+                }
+            }
+            if let Ok(chunks) = state.db.get_chunk_locations(*id) {
+                for chunk in &chunks {
+                    let _ = state.db.add_free_space(&chunk.store_file, chunk.offset, chunk.length);
+                }
+            }
+            match state.db.delete_file(*id) {
+                Ok(_) => success_count += 1,
+                Err(e) => {
+                    fail_count += 1;
+                    errors.push(format!("删除文件 {} 失败: {}", id, e));
+                }
+            }
+        }
+    }
+
+    Ok(BatchResult { success_count, fail_count, errors })
+}
+
+/// 批量移动（混合文件和文件夹ID），后端负责类型判断
+#[tauri::command]
+fn batch_move(
+    state: tauri::State<Mutex<AppState>>,
+    ids: Vec<i64>,
+    target_folder_id: i64,
+) -> Result<BatchResult, String> {
+    let state = state.lock().unwrap();
+    let all_folders = state.db.get_folders().map_err(|e| e.to_string())?;
+    let mut success_count = 0;
+    let mut fail_count = 0;
+    let mut errors = Vec::new();
+
+    for id in &ids {
+        let is_folder = all_folders.iter().any(|f| f.folder_id == *id);
+        if is_folder {
+            if *id == target_folder_id {
+                fail_count += 1;
+                errors.push("不能将文件夹移动到自身".to_string());
+                continue;
+            }
+            // 防止循环引用
+            let mut check_id = Some(target_folder_id);
+            let mut is_circular = false;
+            while let Some(pid) = check_id {
+                if pid == *id {
+                    is_circular = true;
+                    break;
+                }
+                check_id = all_folders.iter().find(|f| f.folder_id == pid).and_then(|f| f.parent_id);
+            }
+            if is_circular {
+                fail_count += 1;
+                errors.push("不能将文件夹移动到其子文件夹中".to_string());
+                continue;
+            }
+            let folder = all_folders.iter().find(|f| f.folder_id == *id).unwrap();
+            if state.db.check_folder_name_in_parent(Some(target_folder_id), &folder.name, Some(*id)).map_err(|e| e.to_string())? {
+                fail_count += 1;
+                errors.push(format!("目标文件夹下已存在名为 '{}' 的文件夹", folder.name));
+                continue;
+            }
+            match state.db.move_folder(*id, Some(target_folder_id)) {
+                Ok(_) => success_count += 1,
+                Err(e) => {
+                    fail_count += 1;
+                    errors.push(format!("移动文件夹 {} 失败: {}", id, e));
+                }
+            }
+        } else {
+            let file_info = state.db.get_file_info(*id).map_err(|e| e.to_string())?
+                .ok_or_else(|| "文件不存在".to_string())?;
+            if state.db.check_file_name_in_folder(target_folder_id, &file_info.name, Some(*id)).map_err(|e| e.to_string())? {
+                fail_count += 1;
+                errors.push(format!("目标文件夹下已存在名为 '{}' 的文件", file_info.name));
+                continue;
+            }
+            match state.db.move_file(*id, target_folder_id) {
+                Ok(_) => success_count += 1,
+                Err(e) => {
+                    fail_count += 1;
+                    errors.push(format!("移动文件 {} 失败: {}", id, e));
+                }
+            }
+        }
+    }
+
+    Ok(BatchResult { success_count, fail_count, errors })
+}
+
+/// 批量导出（混合文件和文件夹ID），后端负责类型判断和递归导出
+#[tauri::command]
+fn batch_export(
+    state: tauri::State<Mutex<AppState>>,
+    ids: Vec<i64>,
+    target_dir: String,
+) -> Result<Vec<String>, String> {
+    let state = state.lock().unwrap();
+    let target = PathBuf::from(&target_dir);
+    let all_folders = state.db.get_folders().map_err(|e| e.to_string())?;
+    let mut exported = Vec::new();
+
+    for id in &ids {
+        let is_folder = all_folders.iter().any(|f| f.folder_id == *id);
+        if is_folder {
+            export_folder_recursive(&state.db, &state.store_dir, *id, &target, &mut exported)?;
+        } else {
+            let path = storage::export_file(&state.db, &state.store_dir, *id, &target)?;
+            exported.push(path.to_str().unwrap_or("").to_string());
+        }
+    }
+
+    Ok(exported)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -561,6 +788,12 @@ pub fn run() {
             search_files,
             get_thumbnail_path,
             list_dir,
+            // 前后端分离命令
+            get_folder_contents,
+            get_breadcrumb_path,
+            batch_delete,
+            batch_move,
+            batch_export,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
