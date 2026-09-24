@@ -66,6 +66,12 @@ async fn import_files(
         )
     };
 
+    // 确保目标文件夹存在
+    let folders = db.get_folders().map_err(|e| e.to_string())?;
+    if !folders.iter().any(|f| f.folder_id == folder_id) {
+        return Err(format!("目标文件夹 {} 不存在", folder_id));
+    }
+
     let mut success_count = 0;
     let mut fail_count = 0;
     let mut errors = Vec::new();
@@ -316,6 +322,14 @@ fn delete_folder(
 ) -> Result<(), String> {
     let state = state.lock().unwrap();
     
+    // 保护根目录（parent_id IS NULL 的文件夹）
+    let folders = state.db.get_folders().map_err(|e| e.to_string())?;
+    if let Some(folder) = folders.iter().find(|f| f.folder_id == folder_id) {
+        if folder.parent_id.is_none() {
+            return Err("不能删除根目录".to_string());
+        }
+    }
+    
     // Get all thumbnail paths before deletion
     let file_ids = state.db.get_all_file_ids_in_folder_recursive(folder_id).map_err(|e| e.to_string())?;
     let mut thumb_paths = Vec::new();
@@ -561,58 +575,69 @@ fn get_breadcrumb_path(
 #[tauri::command]
 fn batch_delete(
     state: tauri::State<Mutex<AppState>>,
-    ids: Vec<i64>,
+    file_ids: Vec<i64>,
+    folder_ids: Vec<i64>,
 ) -> Result<BatchResult, String> {
     let state = state.lock().unwrap();
-    let all_folders = state.db.get_folders().map_err(|e| e.to_string())?;
     let mut success_count = 0;
     let mut fail_count = 0;
     let mut errors = Vec::new();
 
-    for id in &ids {
-        let is_folder = all_folders.iter().any(|f| f.folder_id == *id);
-        if is_folder {
-            // 收集缩略图路径（只读）
-            let mut thumbs_to_delete = Vec::new();
-            if let Ok(file_ids) = state.db.get_all_file_ids_in_folder_recursive(*id) {
-                for file_id in &file_ids {
-                    if let Ok(Some(thumb_path)) = state.db.get_thumbnail_path(*file_id) {
-                        thumbs_to_delete.push(thumb_path);
-                    }
+    // 删除文件夹
+    for folder_id in &folder_ids {
+        // 保护根目录
+        let folders = state.db.get_folders().map_err(|e| e.to_string())?;
+        if let Some(folder) = folders.iter().find(|f| f.folder_id == *folder_id) {
+            if folder.parent_id.is_none() {
+                fail_count += 1;
+                errors.push(format!("不能删除根目录"));
+                continue;
+            }
+        }
+
+        // 收集缩略图路径（只读）
+        let mut thumbs_to_delete = Vec::new();
+        if let Ok(file_ids) = state.db.get_all_file_ids_in_folder_recursive(*folder_id) {
+            for file_id in &file_ids {
+                if let Ok(Some(thumb_path)) = state.db.get_thumbnail_path(*file_id) {
+                    thumbs_to_delete.push(thumb_path);
                 }
             }
-            // DB删除（含free_space原子记录）
-            match state.db.delete_folder(*id) {
-                Ok(_) => {
-                    for thumb_path in &thumbs_to_delete {
-                        let thumb_file = std::path::Path::new(thumb_path);
-                        if thumb_file.exists() {
-                            let _ = std::fs::remove_file(thumb_file);
-                        }
+        }
+        // DB删除（含free_space原子记录）
+        match state.db.delete_folder(*folder_id) {
+            Ok(_) => {
+                for thumb_path in &thumbs_to_delete {
+                    let thumb_file = std::path::Path::new(thumb_path);
+                    if thumb_file.exists() {
+                        let _ = std::fs::remove_file(thumb_file);
                     }
-                    success_count += 1;
                 }
-                Err(e) => {
-                    fail_count += 1;
-                    errors.push(format!("删除文件夹 {} 失败: {}", id, e));
-                }
+                success_count += 1;
             }
-        } else {
-            let thumb_path = state.db.get_thumbnail_path(*id).ok().flatten();
-            match state.db.delete_file(*id) {
-                Ok(_) => {
-                    if let Some(path) = thumb_path {
-                        let thumb_file = std::path::Path::new(&path);
-                        if thumb_file.exists() {
-                            let _ = std::fs::remove_file(thumb_file);
-                        }
+            Err(e) => {
+                fail_count += 1;
+                errors.push(format!("删除文件夹 {} 失败: {}", folder_id, e));
+            }
+        }
+    }
+
+    // 删除文件
+    for file_id in &file_ids {
+        let thumb_path = state.db.get_thumbnail_path(*file_id).ok().flatten();
+        match state.db.delete_file(*file_id) {
+            Ok(_) => {
+                if let Some(path) = thumb_path {
+                    let thumb_file = std::path::Path::new(&path);
+                    if thumb_file.exists() {
+                        let _ = std::fs::remove_file(thumb_file);
                     }
-                    success_count += 1;
                 }
-                Err(e) => {
-                    fail_count += 1;
-                    errors.push(format!("删除文件 {} 失败: {}", id, e));
-                }
+                success_count += 1;
+            }
+            Err(e) => {
+                fail_count += 1;
+                errors.push(format!("删除文件 {} 失败: {}", file_id, e));
             }
         }
     }
@@ -620,11 +645,12 @@ fn batch_delete(
     Ok(BatchResult { success_count, fail_count, errors })
 }
 
-/// 批量移动（混合文件和文件夹ID），后端负责类型判断
+/// 批量移动（分离文件和文件夹ID）
 #[tauri::command]
 fn batch_move(
     state: tauri::State<Mutex<AppState>>,
-    ids: Vec<i64>,
+    file_ids: Vec<i64>,
+    folder_ids: Vec<i64>,
     target_folder_id: i64,
 ) -> Result<BatchResult, String> {
     let state = state.lock().unwrap();
@@ -633,56 +659,57 @@ fn batch_move(
     let mut fail_count = 0;
     let mut errors = Vec::new();
 
-    for id in &ids {
-        let is_folder = all_folders.iter().any(|f| f.folder_id == *id);
-        if is_folder {
-            if *id == target_folder_id {
+    // 移动文件夹
+    for folder_id in &folder_ids {
+        if *folder_id == target_folder_id {
+            fail_count += 1;
+            errors.push("不能将文件夹移动到自身".to_string());
+            continue;
+        }
+        // 防止循环引用
+        let mut check_id = Some(target_folder_id);
+        let mut is_circular = false;
+        while let Some(pid) = check_id {
+            if pid == *folder_id {
+                is_circular = true;
+                break;
+            }
+            check_id = all_folders.iter().find(|f| f.folder_id == pid).and_then(|f| f.parent_id);
+        }
+        if is_circular {
+            fail_count += 1;
+            errors.push("不能将文件夹移动到其子文件夹中".to_string());
+            continue;
+        }
+        let folder = all_folders.iter().find(|f| f.folder_id == *folder_id).unwrap();
+        if state.db.check_folder_name_in_parent(Some(target_folder_id), &folder.name, Some(*folder_id)).map_err(|e| e.to_string())? {
+            fail_count += 1;
+            errors.push(format!("目标文件夹下已存在名为 '{}' 的文件夹", folder.name));
+            continue;
+        }
+        match state.db.move_folder(*folder_id, Some(target_folder_id)) {
+            Ok(_) => success_count += 1,
+            Err(e) => {
                 fail_count += 1;
-                errors.push("不能将文件夹移动到自身".to_string());
-                continue;
+                errors.push(format!("移动文件夹 {} 失败: {}", folder_id, e));
             }
-            // 防止循环引用
-            let mut check_id = Some(target_folder_id);
-            let mut is_circular = false;
-            while let Some(pid) = check_id {
-                if pid == *id {
-                    is_circular = true;
-                    break;
-                }
-                check_id = all_folders.iter().find(|f| f.folder_id == pid).and_then(|f| f.parent_id);
-            }
-            if is_circular {
+        }
+    }
+
+    // 移动文件
+    for file_id in &file_ids {
+        let file_info = state.db.get_file_info(*file_id).map_err(|e| e.to_string())?
+            .ok_or_else(|| "文件不存在".to_string())?;
+        if state.db.check_file_name_in_folder(target_folder_id, &file_info.name, Some(*file_id)).map_err(|e| e.to_string())? {
+            fail_count += 1;
+            errors.push(format!("目标文件夹下已存在名为 '{}' 的文件", file_info.name));
+            continue;
+        }
+        match state.db.move_file(*file_id, target_folder_id) {
+            Ok(_) => success_count += 1,
+            Err(e) => {
                 fail_count += 1;
-                errors.push("不能将文件夹移动到其子文件夹中".to_string());
-                continue;
-            }
-            let folder = all_folders.iter().find(|f| f.folder_id == *id).unwrap();
-            if state.db.check_folder_name_in_parent(Some(target_folder_id), &folder.name, Some(*id)).map_err(|e| e.to_string())? {
-                fail_count += 1;
-                errors.push(format!("目标文件夹下已存在名为 '{}' 的文件夹", folder.name));
-                continue;
-            }
-            match state.db.move_folder(*id, Some(target_folder_id)) {
-                Ok(_) => success_count += 1,
-                Err(e) => {
-                    fail_count += 1;
-                    errors.push(format!("移动文件夹 {} 失败: {}", id, e));
-                }
-            }
-        } else {
-            let file_info = state.db.get_file_info(*id).map_err(|e| e.to_string())?
-                .ok_or_else(|| "文件不存在".to_string())?;
-            if state.db.check_file_name_in_folder(target_folder_id, &file_info.name, Some(*id)).map_err(|e| e.to_string())? {
-                fail_count += 1;
-                errors.push(format!("目标文件夹下已存在名为 '{}' 的文件", file_info.name));
-                continue;
-            }
-            match state.db.move_file(*id, target_folder_id) {
-                Ok(_) => success_count += 1,
-                Err(e) => {
-                    fail_count += 1;
-                    errors.push(format!("移动文件 {} 失败: {}", id, e));
-                }
+                errors.push(format!("移动文件 {} 失败: {}", file_id, e));
             }
         }
     }
@@ -690,26 +717,27 @@ fn batch_move(
     Ok(BatchResult { success_count, fail_count, errors })
 }
 
-/// 批量导出（混合文件和文件夹ID），后端负责类型判断和递归导出
+/// 批量导出（分离文件和文件夹ID）
 #[tauri::command]
 fn batch_export(
     state: tauri::State<Mutex<AppState>>,
-    ids: Vec<i64>,
+    file_ids: Vec<i64>,
+    folder_ids: Vec<i64>,
     target_dir: String,
 ) -> Result<Vec<String>, String> {
     let state = state.lock().unwrap();
     let target = PathBuf::from(&target_dir);
-    let all_folders = state.db.get_folders().map_err(|e| e.to_string())?;
     let mut exported = Vec::new();
 
-    for id in &ids {
-        let is_folder = all_folders.iter().any(|f| f.folder_id == *id);
-        if is_folder {
-            export_folder_recursive(&state.db, &state.store_dir, *id, &target, &mut exported)?;
-        } else {
-            let path = storage::export_file(&state.db, &state.store_dir, *id, &target)?;
-            exported.push(path.to_str().unwrap_or("").to_string());
-        }
+    // 导出文件夹
+    for folder_id in &folder_ids {
+        export_folder_recursive(&state.db, &state.store_dir, *folder_id, &target, &mut exported)?;
+    }
+
+    // 导出文件
+    for file_id in &file_ids {
+        let path = storage::export_file(&state.db, &state.store_dir, *file_id, &target)?;
+        exported.push(path.to_str().unwrap_or("").to_string());
     }
 
     Ok(exported)
