@@ -121,6 +121,7 @@ async fn import_files(
         success_count,
         fail_count,
         errors,
+        cleanup_recommended: check_cleanup_recommended(&db, &store_dir),
     })
 }
 
@@ -578,7 +579,11 @@ fn batch_delete(
     file_ids: Vec<i64>,
     folder_ids: Vec<i64>,
 ) -> Result<BatchResult, String> {
-    let state = state.lock().unwrap();
+    let (db, store_dir) = {
+        let state = state.lock().unwrap();
+        (state.db.clone(), state.store_dir.clone())
+    };
+    let state_ref = state.lock().unwrap();
     let mut success_count = 0;
     let mut fail_count = 0;
     let mut errors = Vec::new();
@@ -586,7 +591,7 @@ fn batch_delete(
     // 删除文件夹
     for folder_id in &folder_ids {
         // 保护根目录
-        let folders = state.db.get_folders().map_err(|e| e.to_string())?;
+        let folders = state_ref.db.get_folders().map_err(|e| e.to_string())?;
         if let Some(folder) = folders.iter().find(|f| f.folder_id == *folder_id) {
             if folder.parent_id.is_none() {
                 fail_count += 1;
@@ -597,15 +602,15 @@ fn batch_delete(
 
         // 收集缩略图路径（只读）
         let mut thumbs_to_delete = Vec::new();
-        if let Ok(file_ids) = state.db.get_all_file_ids_in_folder_recursive(*folder_id) {
+        if let Ok(file_ids) = state_ref.db.get_all_file_ids_in_folder_recursive(*folder_id) {
             for file_id in &file_ids {
-                if let Ok(Some(thumb_path)) = state.db.get_thumbnail_path(*file_id) {
+                if let Ok(Some(thumb_path)) = state_ref.db.get_thumbnail_path(*file_id) {
                     thumbs_to_delete.push(thumb_path);
                 }
             }
         }
         // DB删除（含free_space原子记录）
-        match state.db.delete_folder(*folder_id) {
+        match state_ref.db.delete_folder(*folder_id) {
             Ok(_) => {
                 for thumb_path in &thumbs_to_delete {
                     let thumb_file = std::path::Path::new(thumb_path);
@@ -624,8 +629,8 @@ fn batch_delete(
 
     // 删除文件
     for file_id in &file_ids {
-        let thumb_path = state.db.get_thumbnail_path(*file_id).ok().flatten();
-        match state.db.delete_file(*file_id) {
+        let thumb_path = state_ref.db.get_thumbnail_path(*file_id).ok().flatten();
+        match state_ref.db.delete_file(*file_id) {
             Ok(_) => {
                 if let Some(path) = thumb_path {
                     let thumb_file = std::path::Path::new(&path);
@@ -642,7 +647,14 @@ fn batch_delete(
         }
     }
 
-    Ok(BatchResult { success_count, fail_count, errors })
+    drop(state_ref);
+
+    Ok(BatchResult {
+        success_count,
+        fail_count,
+        errors,
+        cleanup_recommended: check_cleanup_recommended(&db, &store_dir),
+    })
 }
 
 /// 批量移动（分离文件和文件夹ID）
@@ -714,7 +726,7 @@ fn batch_move(
         }
     }
 
-    Ok(BatchResult { success_count, fail_count, errors })
+    Ok(BatchResult { success_count, fail_count, errors, cleanup_recommended: false })
 }
 
 /// 批量导出（分离文件和文件夹ID）
@@ -741,6 +753,80 @@ fn batch_export(
     }
 
     Ok(exported)
+}
+
+// ==================== 存储管理命令 ====================
+
+const CLEANUP_THRESHOLD: i64 = 4 * 1024 * 1024 * 1024; // 4GB
+
+fn check_cleanup_recommended(db: &Database, store_dir: &Path) -> bool {
+    if let Ok((_, free_space)) = db.get_storage_stats() {
+        if free_space >= CLEANUP_THRESHOLD {
+            return true;
+        }
+    }
+    // 也检查物理文件大小
+    let store_path = store_dir.join("store.bin");
+    if let Ok(meta) = std::fs::metadata(&store_path) {
+        let physical = meta.len() as i64;
+        if physical >= CLEANUP_THRESHOLD {
+            if let Ok((logical, _)) = db.get_storage_stats() {
+                let free_space = physical - logical;
+                if free_space >= CLEANUP_THRESHOLD {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[tauri::command]
+fn get_storage_stats(
+    state: tauri::State<Mutex<AppState>>,
+) -> Result<StorageStats, String> {
+    let state = state.lock().unwrap();
+    let (logical_size, free_space_db) = state.db.get_storage_stats()?;
+
+    // 计算物理大小：所有 store 文件的实际大小
+    let mut physical_size: i64 = 0;
+    if let Ok(entries) = std::fs::read_dir(&state.store_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("store") && name.ends_with(".bin") {
+                physical_size += entry.metadata().map(|m| m.len() as i64).unwrap_or(0);
+            }
+        }
+    }
+
+    // free_space 取 DB 记录和物理差值中的较大值
+    let free_space = std::cmp::max(free_space_db, physical_size - logical_size);
+    let cleanup_recommended = free_space >= CLEANUP_THRESHOLD;
+
+    Ok(StorageStats {
+        logical_size,
+        physical_size,
+        free_space,
+        cleanup_recommended,
+    })
+}
+
+#[tauri::command]
+fn compact_store(
+    state: tauri::State<Mutex<AppState>>,
+) -> Result<CompactResult, String> {
+    let (db, store_dir) = {
+        let state = state.lock().unwrap();
+        (state.db.clone(), state.store_dir.clone())
+    };
+
+    let (freed_bytes, old_physical, new_physical) = storage::compact_store(&db, &store_dir)?;
+
+    Ok(CompactResult {
+        freed_bytes,
+        old_physical,
+        new_physical,
+    })
 }
 
 // ==================== 辅助函数 ====================
@@ -1411,6 +1497,9 @@ pub fn run() {
             batch_delete,
             batch_move,
             batch_export,
+            // 存储管理
+            get_storage_stats,
+            compact_store,
             // 数据库管理
             list_connections,
             get_current_db,

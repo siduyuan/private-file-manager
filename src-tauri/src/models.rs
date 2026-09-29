@@ -38,6 +38,7 @@ pub struct ImportResult {
     pub success_count: i32,
     pub fail_count: i32,
     pub errors: Vec<String>,
+    pub cleanup_recommended: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +69,7 @@ pub struct BatchResult {
     pub success_count: i32,
     pub fail_count: i32,
     pub errors: Vec<String>,
+    pub cleanup_recommended: bool,
 }
 
 // ==================== 数据库管理模型 ====================
@@ -121,4 +123,21 @@ pub struct IntegrityCheckResult {
 pub struct AuthStatus {
     pub auth_required: bool,
     pub logged_in: bool,
+}
+
+// ==================== 存储管理模型 ====================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageStats {
+    pub logical_size: i64,         // 有效数据占用（字节）
+    pub physical_size: i64,        // store 文件实际磁盘占用（字节）
+    pub free_space: i64,           // 可回收空间（字节）
+    pub cleanup_recommended: bool, // 是否建议清理
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactResult {
+    pub freed_bytes: i64,   // 释放的字节数
+    pub old_physical: i64,  // 清理前物理大小
+    pub new_physical: i64,  // 清理后物理大小
 }

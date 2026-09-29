@@ -1,13 +1,13 @@
 import { useState, useEffect } from 'react';
 import {
   Modal, Tabs, Button, Input, Space, List, Tag, message, Popconfirm,
-  Form, Select, Divider, Typography, Card, Descriptions, Tooltip,
+  Form, Select, Divider, Typography, Card, Descriptions, Tooltip, Progress,
 } from 'antd';
 import {
   DatabaseOutlined, PlusOutlined, LinkOutlined, DeleteOutlined,
   EditOutlined, LockOutlined, FolderOpenOutlined, CheckCircleOutlined,
   CloudOutlined, UsbOutlined, HomeOutlined, SettingOutlined,
-  SafetyOutlined, ReloadOutlined,
+  SafetyOutlined, ReloadOutlined, ClearOutlined, ToolOutlined,
 } from '@ant-design/icons';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
@@ -23,6 +23,19 @@ interface DbConnectionInfo {
   is_connected: boolean;
   is_default: boolean;
   has_password: boolean;
+}
+
+interface StorageStats {
+  logical_size: number;
+  physical_size: number;
+  free_space: number;
+  cleanup_recommended: boolean;
+}
+
+interface CompactResult {
+  freed_bytes: number;
+  old_physical: number;
+  new_physical: number;
 }
 
 interface SettingsProps {
@@ -69,9 +82,22 @@ export default function Settings({ open, onClose, onConnectionsChanged, onSwitch
   // 修改默认数据库路径
   const [newDefaultPath, setNewDefaultPath] = useState('');
 
+  // 存储管理
+  const [storageStats, setStorageStats] = useState<StorageStats | null>(null);
+  const [compacting, setCompacting] = useState(false);
+
+  const formatBytes = (bytes: number): string => {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  };
+
   useEffect(() => {
     if (open) {
       loadConnections();
+      loadStorageStats();
     }
   }, [open]);
 
@@ -87,6 +113,28 @@ export default function Settings({ open, onClose, onConnectionsChanged, onSwitch
       onConnectionsChanged();
     } catch (e) {
       message.error(`加载数据库列表失败: ${e}`);
+    }
+  };
+
+  const loadStorageStats = async () => {
+    try {
+      const stats = await invoke<StorageStats>('get_storage_stats');
+      setStorageStats(stats);
+    } catch (e) {
+      console.error('加载存储统计失败:', e);
+    }
+  };
+
+  const handleCompact = async () => {
+    setCompacting(true);
+    try {
+      const result = await invoke<CompactResult>('compact_store');
+      message.success(`深度清理完成，释放了 ${formatBytes(result.freed_bytes)} 空间`);
+      await loadStorageStats();
+    } catch (e) {
+      message.error(`清理失败: ${e}`);
+    } finally {
+      setCompacting(false);
     }
   };
 
@@ -336,6 +384,74 @@ export default function Settings({ open, onClose, onConnectionsChanged, onSwitch
                   );
                 }}
               />
+            </div>
+          ),
+        },
+        {
+          key: 'storage',
+          label: <span><ToolOutlined /> 存储管理</span>,
+          children: (
+            <div>
+              <Title level={5}>存储空间</Title>
+              {storageStats ? (
+                <Descriptions column={1} bordered size="small">
+                  <Descriptions.Item label="有效数据">
+                    <Text strong>{formatBytes(storageStats.logical_size)}</Text>
+                  </Descriptions.Item>
+                  <Descriptions.Item label="磁盘占用">
+                    <Text strong>{formatBytes(storageStats.physical_size)}</Text>
+                  </Descriptions.Item>
+                  <Descriptions.Item label="可回收空间">
+                    <Text strong type={storageStats.cleanup_recommended ? 'danger' : undefined}>
+                      {formatBytes(storageStats.free_space)}
+                    </Text>
+                    {storageStats.cleanup_recommended && (
+                      <Tag color="orange" style={{ marginLeft: 8 }}>建议清理</Tag>
+                    )}
+                  </Descriptions.Item>
+                  <Descriptions.Item label="空间使用率">
+                    <Progress
+                      percent={storageStats.physical_size > 0
+                        ? Math.round((storageStats.logical_size / storageStats.physical_size) * 100)
+                        : 0}
+                      status={storageStats.cleanup_recommended ? 'exception' : 'active'}
+                      style={{ width: 200 }}
+                    />
+                  </Descriptions.Item>
+                </Descriptions>
+              ) : (
+                <Text type="secondary">加载中...</Text>
+              )}
+
+              <Divider />
+
+              <Title level={5}>深度清理</Title>
+              <Text type="secondary" style={{ display: 'block', marginBottom: 16 }}>
+                将有效数据紧凑重写到单个存储文件，释放已删除数据占用的磁盘空间。
+                此操作需要重写所有数据，大文件库可能需要较长时间。
+              </Text>
+              <Space>
+                <Popconfirm
+                  title="确定执行深度清理？"
+                  description="清理过程中请勿关闭应用"
+                  onConfirm={handleCompact}
+                  okText="开始清理"
+                  cancelText="取消"
+                >
+                  <Button
+                    type="primary"
+                    danger
+                    icon={<ClearOutlined />}
+                    loading={compacting}
+                    disabled={!storageStats?.cleanup_recommended}
+                  >
+                    执行深度清理
+                  </Button>
+                </Popconfirm>
+                <Button icon={<ReloadOutlined />} onClick={loadStorageStats}>
+                  刷新统计
+                </Button>
+              </Space>
             </div>
           ),
         },

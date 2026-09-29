@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::db::Database;
 
-const MAX_STORE_FILE_SIZE: i64 = 2 * 1024 * 1024 * 1024; // 2GB
+const STORE_FILE_NAME: &str = "store.bin";
 
 /// Determine chunk size based on file size
 fn get_chunk_size(file_size: i64) -> i64 {
@@ -97,6 +97,12 @@ pub fn import_file(
     // 需要确保在store_files表中存在的store文件
     let mut new_store_files: Vec<String> = Vec::new();
 
+    let store_file_name = STORE_FILE_NAME.to_string();
+    let store_path = store_dir.join(&store_file_name);
+
+    // 确保 store.bin 在 store_files 表中有记录
+    new_store_files.push(store_file_name.clone());
+
     let mut remaining = file_size;
 
     while remaining > 0 {
@@ -109,34 +115,20 @@ pub fn import_file(
             .map_err(|e| format!("Read error: {}", e))?;
 
         // 优先使用free_space（Best-fit）
-        let (store_file_name, current_offset, space_id, free_length) =
+        let (current_offset, space_id, free_length) =
             match db.find_free_space(current_chunk_size).map_err(|e| format!("DB free space error: {}", e))? {
-                Some((sid, sf, off)) => {
-                    // 查询free_space条目的实际长度
+                Some((sid, _sf, off)) => {
                     let free_len = db.get_free_space_length(sid).map_err(|e| format!("DB error: {}", e))?;
-                    (sf, off, sid, free_len)
+                    (off, sid, free_len)
                 }
                 None => {
-                    // 查找有空间的store_file
-                    let store_file_name = match db.find_available_store_file(store_dir, MAX_STORE_FILE_SIZE)
-                        .map_err(|e| format!("DB store file error: {}", e))? {
-                        Some(sf) => sf,
-                        None => {
-                            let name = db.get_next_store_file_name()
-                                .map_err(|e| format!("DB error: {}", e))?;
-                            new_store_files.push(name.clone());
-                            name
-                        }
-                    };
-                    let store_path = store_dir.join(&store_file_name);
+                    // 追加到 store.bin 末尾
                     let current_offset = fs::metadata(&store_path)
                         .map(|m| m.len())
                         .unwrap_or(0);
-                    (store_file_name, current_offset as i64, 0i64, 0i64)
+                    (current_offset as i64, 0i64, 0i64)
                 }
             };
-
-        let store_path = store_dir.join(&store_file_name);
 
         // Write chunk to store file
         {
@@ -146,7 +138,6 @@ pub fn import_file(
                     .write(true)
                     .open(&store_path)
                     .map_err(|e| format!("Failed to open store file for reuse: {}", e))?;
-                use std::io::Seek;
                 f.seek(SeekFrom::Start(current_offset as u64))
                     .map_err(|e| format!("Seek error: {}", e))?;
                 f
@@ -167,7 +158,6 @@ pub fn import_file(
             // 使用了free_space，处理残余空间
             let remainder = free_length - current_chunk_size;
             if remainder > 0 {
-                // 残余空间回写为新的free_space条目
                 new_free_space.push((store_file_name.clone(), current_offset + current_chunk_size, remainder));
             }
         } else {
@@ -179,7 +169,7 @@ pub fn import_file(
             }
         }
 
-        chunk_data.push((store_file_name, current_offset, current_chunk_size, space_id));
+        chunk_data.push((store_file_name.clone(), current_offset, current_chunk_size, space_id));
 
         remaining -= current_chunk_size;
     }
@@ -343,6 +333,113 @@ pub fn generate_image_thumbnail(
         .map_err(|e| format!("DB thumbnail error: {}", e))?;
 
     Ok(())
+}
+
+/// 深度清理：将所有有效分片紧凑重写到单个 store.bin，释放碎片空间
+/// 返回 (释放字节数, 旧物理大小, 新物理大小)
+pub fn compact_store(
+    db: &Database,
+    store_dir: &Path,
+) -> Result<(i64, i64, i64), String> {
+    let store_path = store_dir.join(STORE_FILE_NAME);
+    let temp_path = store_dir.join("store_compact.tmp");
+    let backup_path = store_dir.join("store_old.bin");
+
+    // 获取旧物理大小
+    let old_physical = fs::metadata(&store_path)
+        .map(|m| m.len() as i64)
+        .unwrap_or(0);
+
+    // 获取所有有效分片（已按 store_file, offset 排序）
+    let chunks = db.get_all_valid_chunks()?;
+
+    // 如果没有分片，直接清空 store 文件
+    if chunks.is_empty() {
+        db.compact_update(&[])?;
+        // 关闭所有句柄后删除
+        drop(chunks);
+        if store_path.exists() {
+            let _ = fs::remove_file(&store_path);
+        }
+        return Ok((old_physical, old_physical, 0));
+    }
+
+    // 写入紧凑的临时文件，记录新的偏移量
+    let mut new_chunks: Vec<(i64, i32, String, i64, i64)> = Vec::with_capacity(chunks.len());
+    let mut current_offset: i64 = 0;
+
+    {
+        let mut temp_file = File::create(&temp_path)
+            .map_err(|e| format!("创建临时文件失败: {}", e))?;
+
+        for chunk in &chunks {
+            // 从旧 store 文件读取数据（每个 chunk 独立打开/关闭，避免长时间持有句柄）
+            let src_path = store_dir.join(&chunk.store_file);
+            {
+                let mut src_file = File::open(&src_path)
+                    .map_err(|e| format!("打开 store 文件失败: {}", e))?;
+                src_file.seek(SeekFrom::Start(chunk.offset as u64))
+                    .map_err(|e| format!("Seek 失败: {}", e))?;
+
+                let mut buffer = vec![0u8; chunk.length as usize];
+                src_file.read_exact(&mut buffer)
+                    .map_err(|e| format!("读取分片失败: {}", e))?;
+
+                temp_file.write_all(&buffer)
+                    .map_err(|e| format!("写入临时文件失败: {}", e))?;
+            } // src_file 在这里被 drop，释放文件句柄
+
+            new_chunks.push((
+                chunk.file_id,
+                chunk.chunk_index,
+                STORE_FILE_NAME.to_string(),
+                current_offset,
+                chunk.length,
+            ));
+
+            current_offset += chunk.length;
+        }
+        temp_file.flush().map_err(|e| format!("flush 失败: {}", e))?;
+    } // temp_file 在这里被 drop，释放文件句柄
+
+    let new_physical = current_offset;
+    let freed_bytes = old_physical - new_physical;
+
+    // 原子更新 DB（事务内替换所有分片记录 + 清空 free_space）
+    db.compact_update(&new_chunks)?;
+
+    // 替换 store 文件（Windows 安全方式：rename swap）
+    // 1. 先清理可能残留的 backup
+    if backup_path.exists() {
+        fs::remove_file(&backup_path)
+            .map_err(|e| format!("清理旧备份文件失败: {}", e))?;
+    }
+    // 2. 旧 store.bin → backup
+    if store_path.exists() {
+        fs::rename(&store_path, &backup_path)
+            .map_err(|e| format!("备份旧 store 文件失败: {}", e))?;
+    }
+    // 3. temp → store.bin
+    fs::rename(&temp_path, &store_path)
+        .map_err(|e| {
+            // 回滚：把 backup 改回 store.bin
+            let _ = fs::rename(&backup_path, &store_path);
+            format!("替换 store 文件失败: {}", e)
+        })?;
+    // 4. 删除 backup
+    let _ = fs::remove_file(&backup_path);
+
+    // 清理旧的多 store 文件（向后兼容迁移）
+    if let Ok(entries) = fs::read_dir(store_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("store_") && name.ends_with(".bin") && name != STORE_FILE_NAME {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    Ok((freed_bytes, old_physical, new_physical))
 }
 
 /// Generate thumbnail for a video file using ffmpeg

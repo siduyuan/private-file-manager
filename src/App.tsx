@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Layout, Tree, Table, Button, Input, Space, Breadcrumb, Dropdown, message, Modal, Tooltip, Menu } from 'antd';
+import { Layout, Tree, Table, Button, Input, Space, Breadcrumb, Dropdown, message, notification, Modal, Tooltip, Menu } from 'antd';
 import {
   FolderOutlined,
   FolderOpenOutlined,
@@ -64,6 +64,7 @@ interface ImportResult {
   success_count: number;
   fail_count: number;
   errors: string[];
+  cleanup_recommended: boolean;
 }
 
 interface FolderContentsItem {
@@ -90,6 +91,7 @@ interface BatchResult {
   success_count: number;
   fail_count: number;
   errors: string[];
+  cleanup_recommended: boolean;
 }
 
 interface DbConnectionInfo {
@@ -220,15 +222,14 @@ function getFileIcon(category: string | null, ext?: string | null) {
 function App() {
   const [folders, setFolders] = useState<FolderInfo[]>([]);
   const [items, setItems] = useState<FolderContentsItem[]>([]);
-  const [currentFolderId, setCurrentFolderId] = useState<number>(1);
+  const [currentFolderId, setCurrentFolderId] = useState<number>(0);
+  const initializedRef = useRef(false);
   const [selectedFileIds, setSelectedFileIds] = useState<number[]>([]);
   const [selectedFolderIds, setSelectedFolderIds] = useState<number[]>([]);
   const [searchKeyword, setSearchKeyword] = useState('');
   const [viewMode, setViewMode] = useState<'list' | 'grid'>('list');
   const [, setLoading] = useState(false);
-  const [breadcrumb, setBreadcrumb] = useState<{ id: number; name: string }[]>([
-    { id: 1, name: '根目录' },
-  ]);
+  const [breadcrumb, setBreadcrumb] = useState<{ id: number; name: string }[]>([]);
 
   // 认证 & 数据库管理状态
   const [appReady, setAppReady] = useState(false);
@@ -303,11 +304,14 @@ function App() {
     try {
       await invoke('switch_database', { uuid });
       message.success('数据库已切换');
-      setCurrentFolderId(1);
-      setBreadcrumb([{ id: 1, name: '根目录' }]);
+      const allFolders = await loadFolders();
+      const root = allFolders.find(f => f.parent_id === null);
+      if (root) {
+        setCurrentFolderId(root.folder_id);
+        setBreadcrumb([{ id: root.folder_id, name: root.name }]);
+        await loadFolderContents(root.folder_id);
+      }
       loadConnections();
-      loadFolders();
-      loadFolderContents(1);
     } catch (e) {
       message.error('切换失败: ' + e);
     }
@@ -335,8 +339,10 @@ function App() {
     try {
       const result = await invoke<FolderInfo[]>('get_folders');
       setFolders(result);
+      return result;
     } catch (e) {
       console.error('Failed to load folders:', e);
+      return [] as FolderInfo[];
     }
   }, []);
 
@@ -354,9 +360,21 @@ function App() {
   }, []);
 
   useEffect(() => {
-    loadFolders();
-    loadFolderContents(currentFolderId);
-  }, [currentFolderId, loadFolders, loadFolderContents]);
+    if (!initializedRef.current) {
+      initializedRef.current = true;
+      loadFolders().then(allFolders => {
+        const root = allFolders.find(f => f.parent_id === null);
+        if (root) {
+          setCurrentFolderId(root.folder_id);
+          setBreadcrumb([{ id: root.folder_id, name: root.name }]);
+        }
+      });
+      return;
+    }
+    if (currentFolderId > 0) {
+      loadFolderContents(currentFolderId);
+    }
+  }, [currentFolderId, loadFolderContents]);
 
   // 全局鼠标事件监听，确保拖拽和选择框在鼠标移出内容区域后仍能工作
   useEffect(() => {
@@ -484,6 +502,13 @@ function App() {
         } else {
           message.success(`成功导入 ${result.success_count} 个文件`);
         }
+        if (result.cleanup_recommended) {
+          notification.info({
+            message: '建议执行深度清理',
+            description: '存储空间碎片较多，可在设置中执行深度清理以释放磁盘空间',
+            duration: 8,
+          });
+        }
         loadFolderContents(currentFolderId);
         loadFolders();
       }
@@ -513,6 +538,13 @@ function App() {
           }
         } else {
           message.success(`成功导入 ${result.success_count} 个文件，请查看左侧目录树`);
+        }
+        if (result.cleanup_recommended) {
+          notification.info({
+            message: '建议执行深度清理',
+            description: '存储空间碎片较多，可在设置中执行深度清理以释放磁盘空间',
+            duration: 8,
+          });
         }
         // Refresh both files and folders
         await loadFolders();
@@ -558,6 +590,13 @@ function App() {
         message.warning(`删除完成：成功 ${result.success_count} 个，失败 ${result.fail_count} 个`);
       } else {
         message.success(`已删除 ${result.success_count} 个项目`);
+      }
+      if (result.cleanup_recommended) {
+        notification.info({
+          message: '建议执行深度清理',
+          description: '已释放大量空间碎片，可在设置中执行深度清理以真正回收磁盘空间',
+          duration: 8,
+        });
       }
       setSelectedFileIds([]);
       setSelectedFolderIds([]);
@@ -941,7 +980,7 @@ function App() {
   if (!appReady) {
     return (
       <div style={{ height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-        <Space direction="vertical" align="center">
+        <Space orientation="vertical" align="center">
           <DatabaseOutlined style={{ fontSize: 48, color: '#1890ff' }} />
           <span>正在初始化...</span>
         </Space>
@@ -1078,20 +1117,17 @@ function App() {
         <Layout.Content style={{ overflow: 'auto', background: '#fff' }}>
           {/* Breadcrumb */}
           <div style={{ padding: '8px 16px', borderBottom: '1px solid #f0f0f0' }}>
-            <Breadcrumb>
-              {breadcrumb.map((item, idx) => (
-                <Breadcrumb.Item
-                  key={item.id}
-                  onClick={() => {
-                    setCurrentFolderId(item.id);
-                    setBreadcrumb(breadcrumb.slice(0, idx + 1));
-                  }}
-                  style={{ cursor: 'pointer' }}
-                >
-                  {item.name}
-                </Breadcrumb.Item>
-              ))}
-            </Breadcrumb>
+            <Breadcrumb
+              items={breadcrumb.map((item, idx) => ({
+                key: item.id,
+                title: item.name,
+                onClick: () => {
+                  setCurrentFolderId(item.id);
+                  setBreadcrumb(breadcrumb.slice(0, idx + 1));
+                },
+                className: 'breadcrumb-clickable',
+              }))}
+            />
           </div>
 
           {/* File List / Grid */}

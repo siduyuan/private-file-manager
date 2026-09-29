@@ -796,4 +796,69 @@ impl Database {
 
         Ok((details.is_empty(), details))
     }
+
+    // ==================== 存储统计与压缩 ====================
+
+    /// 获取存储统计信息：有效数据大小、可回收空间
+    pub fn get_storage_stats(&self) -> Result<(i64, i64), String> {
+        let conn = self.conn.lock().unwrap();
+        let logical_size: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(length), 0) FROM chunk_locations",
+            [],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let free_space: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(length), 0) FROM free_space",
+            [],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        Ok((logical_size, free_space))
+    }
+
+    /// 获取所有有效分片，按 store_file, offset 排序（用于压缩）
+    pub fn get_all_valid_chunks(&self) -> Result<Vec<ChunkLocation>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT file_id, chunk_index, store_file, offset, length
+             FROM chunk_locations
+             ORDER BY store_file, offset"
+        ).map_err(|e| e.to_string())?;
+        let chunks = stmt.query_map([], |row| {
+            Ok(ChunkLocation {
+                file_id: row.get(0)?,
+                chunk_index: row.get(1)?,
+                store_file: row.get(2)?,
+                offset: row.get(3)?,
+                length: row.get(4)?,
+            })
+        }).map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+        Ok(chunks)
+    }
+
+    /// 压缩事务：替换所有分片记录并清空 free_space
+    /// new_chunks: (file_id, chunk_index, store_file, offset, length)
+    pub fn compact_update(
+        &self,
+        new_chunks: &[(i64, i32, String, i64, i64)],
+    ) -> Result<(), String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+        tx.execute("DELETE FROM chunk_locations", []).map_err(|e| e.to_string())?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO chunk_locations (file_id, chunk_index, store_file, offset, length)
+                 VALUES (?1, ?2, ?3, ?4, ?5)"
+            ).map_err(|e| e.to_string())?;
+            for (file_id, chunk_index, store_file, offset, length) in new_chunks {
+                stmt.execute(rusqlite::params![file_id, chunk_index, store_file, offset, length])
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+
+        tx.execute("DELETE FROM free_space", []).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
 }
