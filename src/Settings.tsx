@@ -427,7 +427,7 @@ export default function Settings({ open, onClose, onConnectionsChanged, onSwitch
 
               <Title level={5}>深度清理</Title>
               <Text type="secondary" style={{ display: 'block', marginBottom: 16 }}>
-                将有效数据紧凑重写到单个存储文件，释放已删除数据占用的磁盘空间。
+                将有效数据紧凑重写到存储引擎，释放已删除数据占用的磁盘空间。
                 此操作需要重写所有数据，大文件库可能需要较长时间。
               </Text>
               <Space>

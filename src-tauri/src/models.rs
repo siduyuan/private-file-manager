@@ -25,15 +25,6 @@ pub struct FolderInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChunkLocation {
-    pub file_id: i64,
-    pub chunk_index: i32,
-    pub store_file: String,
-    pub offset: i64,
-    pub length: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportResult {
     pub success_count: i32,
     pub fail_count: i32,
@@ -130,7 +121,7 @@ pub struct AuthStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageStats {
     pub logical_size: i64,         // 有效数据占用（字节）
-    pub physical_size: i64,        // store 文件实际磁盘占用（字节）
+    pub physical_size: i64,        // emdb 文件实际磁盘占用（字节）
     pub free_space: i64,           // 可回收空间（字节）
     pub cleanup_recommended: bool, // 是否建议清理
 }

@@ -1,24 +1,23 @@
+use emdb::Emdb;
 use rusqlite::{Connection, params};
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// 独立修复程序 - 用于诊断和修复私有文件管理器数据库
 /// 功能：
-///   1. 数据库完整性诊断
-///   2. 导出数据库为SQL文件（数据库导出模式）
-///   3. 从分片文件中还原所有源文件（源文件导出模式）
-///   4. 检测并报告孤儿记录、重叠空间、used_bytes不一致等问题
+///   1. 数据库完整性诊断（SQLite + emdb）
+///   2. 导出数据库为SQL文件
+///   3. 从 emdb 中还原所有源文件
+///   4. 检测并报告孤儿记录等问题
 fn main() {
-    println!("=== 私有文件管理器 - 数据库修复工具 ===\n");
+    println!("=== 私有文件管理器 - 数据库修复工具 (emdb) ===\n");
 
     let args: Vec<String> = std::env::args().collect();
 
-    // 确定数据目录
     let data_dir = if args.len() > 1 {
         PathBuf::from(&args[1])
     } else {
-        // 默认查找当前目录下的 pfm_data
         let exe_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()))
@@ -27,7 +26,7 @@ fn main() {
     };
 
     let db_path = data_dir.join("metadata.db");
-    let store_dir = data_dir.join("store");
+    let blob_path = data_dir.join("blobs.emdb");
 
     if !db_path.exists() {
         eprintln!("错误: 数据库文件不存在: {}", db_path.display());
@@ -37,15 +36,15 @@ fn main() {
 
     println!("数据目录: {}", data_dir.display());
     println!("数据库: {}", db_path.display());
-    println!("分片目录: {}\n", store_dir.display());
+    println!("Blob存储: {}\n", blob_path.display());
 
-    // 显示菜单
     loop {
         println!("请选择操作:");
         println!("  1. 数据库完整性诊断");
-        println!("  2. 导出数据库为SQL文件（数据库导出）");
-        println!("  3. 还原所有源文件（源文件导出）");
+        println!("  2. 导出数据库为SQL文件");
+        println!("  3. 还原所有源文件");
         println!("  4. 全面诊断并修复");
+        println!("  5. 压缩 Blob 存储");
         println!("  0. 退出");
         print!("> ");
         std::io::stdout().flush().ok();
@@ -55,10 +54,11 @@ fn main() {
         let choice = input.trim();
 
         match choice {
-            "1" => diagnose(&db_path, &store_dir),
+            "1" => diagnose(&db_path, &blob_path),
             "2" => export_sql(&db_path, &data_dir),
-            "3" => export_source_files(&db_path, &store_dir, &data_dir),
-            "4" => full_diagnose_and_repair(&db_path, &store_dir, &data_dir),
+            "3" => export_source_files(&db_path, &blob_path, &data_dir),
+            "4" => full_diagnose_and_repair(&db_path, &blob_path, &data_dir),
+            "5" => compact_blob(&blob_path),
             "0" => {
                 println!("退出。");
                 break;
@@ -69,7 +69,7 @@ fn main() {
 }
 
 /// 数据库完整性诊断
-fn diagnose(db_path: &Path, store_dir: &Path) {
+fn diagnose(db_path: &Path, blob_path: &Path) {
     println!("\n--- 数据库完整性诊断 ---\n");
 
     let conn = match Connection::open(db_path) {
@@ -93,7 +93,7 @@ fn diagnose(db_path: &Path, store_dir: &Path) {
         issues.push(format!("SQLite完整性检查失败: {}", integrity));
     }
 
-    // 2. 检查孤儿文件记录（files中有记录但file_folder中无关联）
+    // 2. 检查孤儿文件记录
     print!("  孤儿文件记录检查... ");
     let orphan_files: i64 = conn.query_row(
         "SELECT COUNT(*) FROM files WHERE file_id NOT IN (SELECT file_id FROM file_folder)",
@@ -103,23 +103,10 @@ fn diagnose(db_path: &Path, store_dir: &Path) {
         println!("通过");
     } else {
         println!("发现 {} 条孤儿文件记录", orphan_files);
-        issues.push(format!("发现 {} 条孤儿文件记录（files中有但file_folder中无关联）", orphan_files));
+        issues.push(format!("发现 {} 条孤儿文件记录", orphan_files));
     }
 
-    // 3. 检查孤儿分片记录（chunk_locations中有记录但files中无对应文件）
-    print!("  孤儿分片记录检查... ");
-    let orphan_chunks: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM chunk_locations WHERE file_id NOT IN (SELECT file_id FROM files)",
-        [], |row| row.get(0),
-    ).unwrap_or(0);
-    if orphan_chunks == 0 {
-        println!("通过");
-    } else {
-        println!("发现 {} 条孤儿分片记录", orphan_chunks);
-        issues.push(format!("发现 {} 条孤儿分片记录（chunk_locations中有但files中无对应文件）", orphan_chunks));
-    }
-
-    // 4. 检查孤儿缩略图记录
+    // 3. 检查孤儿缩略图记录
     print!("  孤儿缩略图记录检查... ");
     let orphan_thumbs: i64 = conn.query_row(
         "SELECT COUNT(*) FROM thumbnail_index WHERE file_id NOT IN (SELECT file_id FROM files)",
@@ -132,96 +119,100 @@ fn diagnose(db_path: &Path, store_dir: &Path) {
         issues.push(format!("发现 {} 条孤儿缩略图记录", orphan_thumbs));
     }
 
-    // 5. 检查free_space重叠
-    print!("  空闲空间重叠检查... ");
-    let overlaps: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM free_space f1
-         JOIN free_space f2 ON f1.store_file = f2.store_file
-         AND f1.space_id < f2.space_id
-         AND f1.offset < f2.offset + f2.length
-         AND f2.offset < f1.offset + f1.length",
-        [], |row| row.get(0),
-    ).unwrap_or(0);
-    if overlaps == 0 {
-        println!("通过");
-    } else {
-        println!("发现 {} 对重叠的空闲空间", overlaps);
-        issues.push(format!("发现 {} 对重叠的空闲空间记录", overlaps));
-    }
-
-    // 6. 检查used_bytes一致性
-    print!("  store_files用量一致性检查... ");
-    let mut stmt = conn.prepare(
-        "SELECT sf.store_file, sf.used_bytes,
-                COALESCE(SUM(cl.length), 0) as actual_used
-         FROM store_files sf
-         LEFT JOIN chunk_locations cl ON cl.store_file = sf.store_file
-         GROUP BY sf.store_file
-         HAVING sf.used_bytes != actual_used"
-    ).unwrap();
-    let mismatches: Vec<(String, i64, i64)> = stmt.query_map([], |row| {
-        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
-    if mismatches.is_empty() {
-        println!("通过");
-    } else {
-        println!("发现 {} 个不一致", mismatches.len());
-        for (sf, recorded, actual) in &mismatches {
-            println!("    {} : 记录={} 实际={}", sf, recorded, actual);
-            issues.push(format!("store_file {} used_bytes不一致: 记录={}, 实际={}", sf, recorded, actual));
-        }
-    }
-
-    // 7. 检查分片数据是否可读
-    print!("  分片数据可读性检查... ");
-    let mut stmt = conn.prepare(
-        "SELECT cl.store_file, cl.offset, cl.length, cl.file_id, cl.chunk_index
-         FROM chunk_locations cl ORDER BY cl.file_id, cl.chunk_index"
-    ).unwrap();
-    let chunks: Vec<(String, i64, i64, i64, i32)> = stmt.query_map([], |row| {
-        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
-    }).unwrap().filter_map(|r| r.ok()).collect();
-
-    let mut unreadable = 0;
-    for (store_file, offset, length, file_id, chunk_index) in &chunks {
-        let store_path = store_dir.join(store_file);
-        if !store_path.exists() {
-            unreadable += 1;
-            if unreadable <= 5 {
-                println!("    分片文件不存在: {} (file_id={}, chunk={})", store_file, file_id, chunk_index);
+    // 4. 检查 emdb blob 存储
+    print!("  Blob存储检查... ");
+    if blob_path.exists() {
+        match Emdb::open(blob_path) {
+            Ok(blob_db) => {
+                match blob_db.stats() {
+                    Ok(stats) => {
+                        println!("通过 (记录数={}, 文件大小={})",
+                            stats.live_records, format_size(stats.file_size_bytes as i64));
+                    }
+                    Err(e) => {
+                        println!("统计失败: {}", e);
+                        issues.push(format!("Blob统计失败: {}", e));
+                    }
+                }
             }
-            continue;
-        }
-        let file_len = fs::metadata(&store_path).map(|m| m.len()).unwrap_or(0) as i64;
-        if offset + length > file_len {
-            unreadable += 1;
-            if unreadable <= 5 {
-                println!("    分片越界: {} offset={} length={} 文件大小={} (file_id={})", store_file, offset, length, file_len, file_id);
+            Err(e) => {
+                println!("打开失败: {}", e);
+                issues.push(format!("Blob打开失败: {}", e));
             }
         }
-    }
-    if unreadable == 0 {
-        println!("通过 ({} 个分片)", chunks.len());
     } else {
-        println!("发现 {} 个不可读分片 (共 {} 个)", unreadable, chunks.len());
-        issues.push(format!("发现 {} 个不可读分片", unreadable));
+        println!("blob文件不存在");
+        issues.push("Blob存储文件不存在".to_string());
     }
 
-    // 8. 统计信息
+    // 5. 检查文件记录是否有对应的 blob 数据（抽样检查前10个文件）
+    print!("  文件Blob可读性检查... ");
+    {
+        let mut stmt = conn.prepare(
+            "SELECT file_id, name, size_bytes FROM files ORDER BY file_id LIMIT 10"
+        ).unwrap();
+        let files: Vec<(i64, String, i64)> = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        }).unwrap().filter_map(|r| r.ok()).collect();
+
+        let mut readable = 0;
+        let mut checked = 0;
+
+        if let Ok(blob_db) = Emdb::open(blob_path) {
+            for (file_id, name, size_bytes) in &files {
+                let chunk_count = get_chunk_count(*size_bytes);
+                let mut file_ok = true;
+                for chunk_idx in 0..chunk_count {
+                    let key = format!("f:{}:{}", file_id, chunk_idx);
+                    match blob_db.get(key.as_bytes()) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            file_ok = false;
+                            break;
+                        }
+                        Err(_) => {
+                            file_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if file_ok {
+                    readable += 1;
+                } else if checked < 5 {
+                    println!("\n    Blob缺失: file_id={} name={}", file_id, name);
+                }
+                checked += 1;
+            }
+        }
+
+        if files.is_empty() {
+            println!("跳过 (无文件)");
+        } else if readable == checked {
+            println!("通过 (抽样 {} 个文件)", checked);
+        } else {
+            println!("{} / {} 个文件Blob不完整", checked - readable, checked);
+            issues.push(format!("{} / {} 个文件Blob不可读", checked - readable, checked));
+        }
+    }
+
+    // 6. 统计信息
     println!("\n--- 统计信息 ---");
     let file_count: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0)).unwrap_or(0);
     let folder_count: i64 = conn.query_row("SELECT COUNT(*) FROM folders", [], |row| row.get(0)).unwrap_or(0);
-    let chunk_count: i64 = conn.query_row("SELECT COUNT(*) FROM chunk_locations", [], |row| row.get(0)).unwrap_or(0);
-    let free_space_count: i64 = conn.query_row("SELECT COUNT(*) FROM free_space", [], |row| row.get(0)).unwrap_or(0);
     let total_size: i64 = conn.query_row("SELECT COALESCE(SUM(size_bytes), 0) FROM files", [], |row| row.get(0)).unwrap_or(0);
-    let store_file_count: i64 = conn.query_row("SELECT COUNT(*) FROM store_files", [], |row| row.get(0)).unwrap_or(0);
 
     println!("  文件记录: {} 个", file_count);
     println!("  文件夹: {} 个", folder_count);
-    println!("  分片记录: {} 个", chunk_count);
-    println!("  空闲空间: {} 条", free_space_count);
     println!("  文件总大小: {}", format_size(total_size));
-    println!("  分片文件: {} 个", store_file_count);
+
+    if blob_path.exists() {
+        if let Ok(blob_db) = Emdb::open(blob_path) {
+            if let Ok(stats) = blob_db.stats() {
+                println!("  Blob记录数: {}", stats.live_records);
+                println!("  Blob文件大小: {}", format_size(stats.file_size_bytes as i64));
+            }
+        }
+    }
 
     // 汇总
     println!("\n--- 诊断结果 ---");
@@ -257,17 +248,15 @@ fn export_sql(db_path: &Path, data_dir: &Path) {
         }
     };
 
-    writeln!(output, "-- 私有文件管理器数据库导出").ok();
+    writeln!(output, "-- 私有文件管理器数据库导出 (emdb)").ok();
     writeln!(output, "-- 导出时间: {}", chrono::Utc::now()).ok();
     writeln!(output, "-- 数据库路径: {}", db_path.display()).ok();
     writeln!(output).ok();
 
-    // 导出表结构
-    let tables = ["files", "folders", "file_folder", "chunk_locations", "store_files", "thumbnail_index", "free_space"];
+    let tables = ["files", "folders", "file_folder", "thumbnail_index", "db_properties"];
     for table in &tables {
         writeln!(output, "-- ========== {} ==========", table).ok();
 
-        // 导出CREATE语句
         let schema: String = conn.query_row(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
             params![table],
@@ -278,7 +267,6 @@ fn export_sql(db_path: &Path, data_dir: &Path) {
             writeln!(output).ok();
         }
 
-        // 导出数据
         let mut stmt = match conn.prepare(&format!("SELECT * FROM {}", table)) {
             Ok(s) => s,
             Err(e) => {
@@ -294,10 +282,14 @@ fn export_sql(db_path: &Path, data_dir: &Path) {
                 let val: String = match row.get::<_, String>(i) {
                     Ok(v) => format!("'{}'", v.replace('\'', "''")),
                     Err(_) => {
-                        // 尝试作为整数
                         match row.get::<_, i64>(i) {
                             Ok(v) => v.to_string(),
-                            Err(_) => "NULL".to_string(),
+                            Err(_) => {
+                                match row.get::<_, f64>(i) {
+                                    Ok(v) => v.to_string(),
+                                    Err(_) => "NULL".to_string(),
+                                }
+                            }
                         }
                     }
                 };
@@ -332,8 +324,8 @@ fn export_sql(db_path: &Path, data_dir: &Path) {
     println!();
 }
 
-/// 从分片文件中还原所有源文件
-fn export_source_files(db_path: &Path, store_dir: &Path, data_dir: &Path) {
+/// 从 emdb 中还原所有源文件
+fn export_source_files(db_path: &Path, blob_path: &Path, data_dir: &Path) {
     println!("\n--- 还原所有源文件 ---\n");
 
     let conn = match Connection::open(db_path) {
@@ -344,21 +336,28 @@ fn export_source_files(db_path: &Path, store_dir: &Path, data_dir: &Path) {
         }
     };
 
+    let blob_db = match Emdb::open(blob_path) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("无法打开Blob存储: {}", e);
+            return;
+        }
+    };
+
     let output_dir = data_dir.join(format!("exported_files_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S")));
     if let Err(e) = fs::create_dir_all(&output_dir) {
         eprintln!("无法创建输出目录: {}", e);
         return;
     }
 
-    // 获取所有文件信息及其分片位置
     let mut stmt = conn.prepare(
-        "SELECT f.file_id, f.name, f.ext, f.size_bytes
+        "SELECT f.file_id, f.name, f.size_bytes
          FROM files f
          ORDER BY f.file_id"
     ).unwrap();
 
-    let files: Vec<(i64, String, Option<String>, i64)> = stmt.query_map([], |row| {
-        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    let files: Vec<(i64, String, i64)> = stmt.query_map([], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
     }).unwrap().filter_map(|r| r.ok()).collect();
 
     println!("  找到 {} 个文件记录", files.len());
@@ -367,30 +366,24 @@ fn export_source_files(db_path: &Path, store_dir: &Path, data_dir: &Path) {
     let mut success = 0;
     let mut failed = 0;
 
-    for (file_id, name, _ext, size_bytes) in &files {
-        // 获取分片位置
-        let mut chunk_stmt = conn.prepare(
-            "SELECT store_file, offset, length FROM chunk_locations
-             WHERE file_id = ? ORDER BY chunk_index"
-        ).unwrap();
+    for (file_id, name, size_bytes) in &files {
+        let chunk_count = get_chunk_count(*size_bytes);
 
-        let chunks: Vec<(String, i64, i64)> = chunk_stmt.query_map(params![file_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        }).unwrap().filter_map(|r| r.ok()).collect();
+        let file_output_path = output_dir.join(&name);
+        // 避免同名覆盖
+        let file_output_path = if file_output_path.exists() {
+            let stem = file_output_path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+            let ext = file_output_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if ext.is_empty() {
+                output_dir.join(format!("{} ({})", stem, file_id))
+            } else {
+                output_dir.join(format!("{} ({}).{}", stem, file_id, ext))
+            }
+        } else {
+            file_output_path
+        };
 
-        if chunks.is_empty() {
-            println!("  [跳过] file_id={} name={} (无分片记录)", file_id, name);
-            failed += 1;
-            continue;
-        }
-
-        // 构建输出路径（按file_id组织，避免同名冲突）
-        let file_output_dir = output_dir.join(format!("file_{}", file_id));
-        fs::create_dir_all(&file_output_dir).ok();
-        let output_path = file_output_dir.join(&name);
-
-        // 还原文件
-        let mut output_file = match File::create(&output_path) {
+        let mut output_file = match File::create(&file_output_path) {
             Ok(f) => f,
             Err(e) => {
                 println!("  [失败] file_id={} name={}: {}", file_id, name, e);
@@ -400,50 +393,41 @@ fn export_source_files(db_path: &Path, store_dir: &Path, data_dir: &Path) {
         };
 
         let mut file_ok = true;
-        let mut total_read = 0i64;
+        let mut total_written = 0i64;
 
-        for (store_file, offset, length) in &chunks {
-            let store_path = store_dir.join(store_file);
-            let mut store = match File::open(&store_path) {
-                Ok(f) => f,
-                Err(e) => {
-                    println!("  [失败] file_id={} 分片文件{}打开失败: {}", file_id, store_file, e);
+        for chunk_idx in 0..chunk_count {
+            let key = format!("f:{}:{}", file_id, chunk_idx);
+            match blob_db.get(key.as_bytes()) {
+                Ok(Some(data)) => {
+                    if let Err(e) = output_file.write_all(&data) {
+                        println!("  [失败] file_id={} 写入失败: {}", file_id, e);
+                        file_ok = false;
+                        break;
+                    }
+                    total_written += data.len() as i64;
+                }
+                Ok(None) => {
+                    println!("  [失败] file_id={} 分片缺失: chunk={}", file_id, chunk_idx);
                     file_ok = false;
                     break;
                 }
-            };
-
-            if let Err(e) = store.seek(SeekFrom::Start(*offset as u64)) {
-                println!("  [失败] file_id={} seek失败: {}", file_id, e);
-                file_ok = false;
-                break;
+                Err(e) => {
+                    println!("  [失败] file_id={} 读取分片失败: {}", file_id, e);
+                    file_ok = false;
+                    break;
+                }
             }
-
-            let mut buffer = vec![0u8; *length as usize];
-            if let Err(e) = store.read_exact(&mut buffer) {
-                println!("  [失败] file_id={} 读取失败: {}", file_id, e);
-                file_ok = false;
-                break;
-            }
-
-            if let Err(e) = output_file.write_all(&buffer) {
-                println!("  [失败] file_id={} 写入失败: {}", file_id, e);
-                file_ok = false;
-                break;
-            }
-
-            total_read += length;
         }
 
         if file_ok {
-            if total_read != *size_bytes {
-                println!("  [警告] file_id={} name={} 大小不匹配: 预期={} 实际={}", file_id, name, size_bytes, total_read);
+            if total_written != *size_bytes {
+                println!("  [警告] file_id={} name={} 大小不匹配: 预期={} 实际={}", file_id, name, size_bytes, total_written);
             }
             success += 1;
             println!("  [成功] file_id={} name={} ({})", file_id, name, format_size(*size_bytes));
         } else {
             failed += 1;
-            let _ = fs::remove_file(&output_path);
+            let _ = fs::remove_file(&file_output_path);
         }
     }
 
@@ -452,11 +436,10 @@ fn export_source_files(db_path: &Path, store_dir: &Path, data_dir: &Path) {
 }
 
 /// 全面诊断并尝试修复
-fn full_diagnose_and_repair(db_path: &Path, store_dir: &Path, data_dir: &Path) {
+fn full_diagnose_and_repair(db_path: &Path, blob_path: &Path, data_dir: &Path) {
     println!("\n--- 全面诊断并修复 ---\n");
 
-    // 先诊断
-    diagnose(db_path, store_dir);
+    diagnose(db_path, blob_path);
 
     println!("是否尝试自动修复? (y/N): ");
     std::io::stdout().flush().ok();
@@ -474,7 +457,6 @@ fn full_diagnose_and_repair(db_path: &Path, store_dir: &Path, data_dir: &Path) {
         eprintln!("  备份失败: {}", e);
         return;
     }
-    // 同时备份WAL和SHM文件
     let wal_path = db_path.with_extension("db-wal");
     if wal_path.exists() {
         let _ = fs::copy(&wal_path, backup_path.with_extension("db-wal"));
@@ -494,15 +476,7 @@ fn full_diagnose_and_repair(db_path: &Path, store_dir: &Path, data_dir: &Path) {
     };
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;").ok();
 
-    // 1. 清理孤儿分片记录
-    print!("  清理孤儿分片记录... ");
-    let deleted = conn.execute(
-        "DELETE FROM chunk_locations WHERE file_id NOT IN (SELECT file_id FROM files)",
-        [],
-    ).unwrap_or(0);
-    println!("删除 {} 条", deleted);
-
-    // 2. 清理孤儿缩略图记录
+    // 1. 清理孤儿缩略图记录
     print!("  清理孤儿缩略图记录... ");
     let deleted = conn.execute(
         "DELETE FROM thumbnail_index WHERE file_id NOT IN (SELECT file_id FROM files)",
@@ -510,7 +484,7 @@ fn full_diagnose_and_repair(db_path: &Path, store_dir: &Path, data_dir: &Path) {
     ).unwrap_or(0);
     println!("删除 {} 条", deleted);
 
-    // 3. 清理孤儿文件记录（无folder关联的）
+    // 2. 清理孤儿文件记录（无folder关联的）
     print!("  清理孤儿文件记录... ");
     let deleted = conn.execute(
         "DELETE FROM files WHERE file_id NOT IN (SELECT file_id FROM file_folder)",
@@ -518,53 +492,78 @@ fn full_diagnose_and_repair(db_path: &Path, store_dir: &Path, data_dir: &Path) {
     ).unwrap_or(0);
     println!("删除 {} 条", deleted);
 
-    // 4. 清理重叠的free_space
-    print!("  清理重叠空闲空间... ");
-    let deleted = conn.execute(
-        "DELETE FROM free_space WHERE space_id IN (
-            SELECT f2.space_id FROM free_space f1
-            JOIN free_space f2 ON f1.store_file = f2.store_file
-            AND f1.space_id < f2.space_id
-            AND f1.offset < f2.offset + f2.length
-            AND f2.offset < f1.offset + f1.length
-        )",
-        [],
-    ).unwrap_or(0);
-    println!("删除 {} 条", deleted);
-
-    // 5. 修正used_bytes
-    print!("  修正store_files用量... ");
-    let updated = conn.execute(
-        "UPDATE store_files SET used_bytes = (
-            SELECT COALESCE(SUM(cl.length), 0) FROM chunk_locations cl
-            WHERE cl.store_file = store_files.store_file
-        )",
-        [],
-    ).unwrap_or(0);
-    println!("更新 {} 条", updated);
-
-    // 6. 清理与chunk_locations重叠的free_space（已被占用的空间不应在free_space中）
-    print!("  清理被占用的空闲空间... ");
-    let deleted = conn.execute(
-        "DELETE FROM free_space WHERE EXISTS (
-            SELECT 1 FROM chunk_locations cl
-            WHERE cl.store_file = free_space.store_file
-            AND cl.offset < free_space.offset + free_space.length
-            AND free_space.offset < cl.offset + cl.length
-        )",
-        [],
-    ).unwrap_or(0);
-    println!("删除 {} 条", deleted);
-
-    // 7. VACUUM 压缩数据库
+    // 3. VACUUM 压缩数据库
     print!("  压缩数据库... ");
     match conn.execute_batch("VACUUM") {
         Ok(_) => println!("完成"),
         Err(e) => println!("失败: {}", e),
     }
 
+    // 4. 压缩 emdb
+    print!("  压缩Blob存储... ");
+    if blob_path.exists() {
+        match Emdb::open(blob_path) {
+            Ok(blob_db) => {
+                match blob_db.compact() {
+                    Ok(_) => println!("完成"),
+                    Err(e) => println!("失败: {}", e),
+                }
+            }
+            Err(e) => println!("打开失败: {}", e),
+        }
+    } else {
+        println!("跳过 (blob文件不存在)");
+    }
+
     println!("\n  修复完成。如有问题，可从备份恢复:");
     println!("  备份路径: {}\n", backup_path.display());
+}
+
+/// 压缩 Blob 存储
+fn compact_blob(blob_path: &Path) {
+    println!("\n--- 压缩 Blob 存储 ---\n");
+
+    if !blob_path.exists() {
+        println!("Blob文件不存在: {}", blob_path.display());
+        return;
+    }
+
+    let old_size = fs::metadata(blob_path).map(|m| m.len()).unwrap_or(0);
+    println!("  压缩前大小: {}", format_size(old_size as i64));
+
+    match Emdb::open(blob_path) {
+        Ok(blob_db) => {
+            match blob_db.compact() {
+                Ok(_) => {
+                    let new_size = fs::metadata(blob_path).map(|m| m.len()).unwrap_or(0);
+                    println!("  压缩后大小: {}", format_size(new_size as i64));
+                    println!("  释放空间: {}", format_size((old_size - new_size) as i64));
+                }
+                Err(e) => println!("  压缩失败: {}", e),
+            }
+        }
+        Err(e) => println!("  打开失败: {}", e),
+    }
+    println!();
+}
+
+/// 计算分片数量（与 storage.rs 中的逻辑一致）
+fn get_chunk_count(file_size: i64) -> i32 {
+    if file_size <= 0 {
+        return 0;
+    }
+    let chunk_size = get_chunk_size(file_size);
+    ((file_size + chunk_size - 1) / chunk_size) as i32
+}
+
+fn get_chunk_size(file_size: i64) -> i64 {
+    if file_size < 100 * 1024 {
+        file_size
+    } else if file_size < 50 * 1024 * 1024 {
+        64 * 1024
+    } else {
+        256 * 1024
+    }
 }
 
 fn format_size(bytes: i64) -> String {

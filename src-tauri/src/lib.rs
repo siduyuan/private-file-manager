@@ -1,3 +1,4 @@
+mod blob_store;
 mod db;
 mod models;
 mod registry;
@@ -8,13 +9,14 @@ use std::sync::Mutex;
 
 use sha2::{Sha256, Digest};
 use tauri::Manager;
+use blob_store::BlobStore;
 use db::Database;
 use models::*;
 use registry::{Registry, DbConnection};
 
 struct AppState {
     db: Database,
-    store_dir: PathBuf,
+    blob: BlobStore,
     thumb_dir: PathBuf,
     temp_dir: PathBuf,
     registry: Registry,
@@ -43,7 +45,6 @@ fn create_folder(
     parent_id: Option<i64>,
 ) -> Result<i64, String> {
     let state = state.lock().unwrap();
-    // Windows风格：同级不能有同名文件夹
     if state.db.check_folder_name_in_parent(parent_id, &name, None).map_err(|e| e.to_string())? {
         return Err(format!("该文件夹下已存在名为 '{}' 的文件夹", name));
     }
@@ -56,11 +57,11 @@ async fn import_files(
     file_paths: Vec<String>,
     folder_id: i64,
 ) -> Result<ImportResult, String> {
-    let (db, store_dir, thumb_dir, temp_dir) = {
+    let (db, blob, thumb_dir, temp_dir) = {
         let state = state.lock().unwrap();
         (
             state.db.clone(),
-            state.store_dir.clone(),
+            state.blob.clone(),
             state.thumb_dir.clone(),
             state.temp_dir.clone(),
         )
@@ -76,25 +77,22 @@ async fn import_files(
     let mut fail_count = 0;
     let mut errors = Vec::new();
 
-    // Process each path
     for path_str in &file_paths {
         let path = PathBuf::from(path_str);
-        
+
         if path.is_file() {
-            // Import single file directly to target folder
-            match storage::import_file(&db, &store_dir, &path, folder_id) {
+            match storage::import_file(&db, &blob, &path, folder_id) {
                 Ok(file_id) => {
-                    // Generate thumbnail for images and videos
                     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                     match ext.to_lowercase().as_str() {
                         "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" => {
                             let _ = storage::generate_image_thumbnail(
-                                &db, &store_dir, &thumb_dir, &temp_dir, file_id,
+                                &db, &blob, &thumb_dir, &temp_dir, file_id,
                             );
                         }
                         "mp4" | "avi" | "mkv" | "mov" | "wmv" | "flv" | "webm" => {
                             if let Err(e) = storage::generate_video_thumbnail(
-                                &db, &store_dir, &thumb_dir, &temp_dir, file_id,
+                                &db, &blob, &thumb_dir, &temp_dir, file_id,
                             ) {
                                 eprintln!("[thumbnail] video failed (file_id={}, path={}): {}", file_id, path_str, e);
                             }
@@ -109,8 +107,7 @@ async fn import_files(
                 }
             }
         } else if path.is_dir() {
-            // Import directory: create folder structure first, then import files
-            let result = import_directory(&db, &store_dir, &thumb_dir, &temp_dir, &path, folder_id);
+            let result = import_directory(&db, &blob, &thumb_dir, &temp_dir, &path, folder_id);
             success_count += result.0;
             fail_count += result.1;
             errors.extend(result.2);
@@ -121,14 +118,13 @@ async fn import_files(
         success_count,
         fail_count,
         errors,
-        cleanup_recommended: check_cleanup_recommended(&db, &store_dir),
+        cleanup_recommended: check_cleanup_recommended(&db, &blob),
     })
 }
 
-// Import a directory with its structure preserved
 fn import_directory(
     db: &db::Database,
-    store_dir: &Path,
+    blob: &BlobStore,
     thumb_dir: &Path,
     temp_dir: &Path,
     source_dir: &Path,
@@ -138,13 +134,11 @@ fn import_directory(
     let mut fail_count = 0;
     let mut errors = Vec::new();
 
-    // Get the directory name
     let dir_name = source_dir
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("imported_folder");
 
-    // Create a new folder in the target location
     let new_folder_id = match db.create_folder(dir_name, Some(target_folder_id)) {
         Ok(id) => id,
         Err(e) => {
@@ -153,7 +147,6 @@ fn import_directory(
         }
     };
 
-    // Read directory contents
     let entries = match std::fs::read_dir(source_dir) {
         Ok(entries) => entries,
         Err(e) => {
@@ -162,25 +155,22 @@ fn import_directory(
         }
     };
 
-    // Process each entry
     for entry in entries.flatten() {
         let entry_path = entry.path();
-        
+
         if entry_path.is_file() {
-            // Import file to the newly created folder
-            match storage::import_file(db, store_dir, &entry_path, new_folder_id) {
+            match storage::import_file(db, blob, &entry_path, new_folder_id) {
                 Ok(file_id) => {
-                    // Generate thumbnail for images and videos
                     let ext = entry_path.extension().and_then(|e| e.to_str()).unwrap_or("");
                     match ext.to_lowercase().as_str() {
                         "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" => {
                             let _ = storage::generate_image_thumbnail(
-                                db, store_dir, thumb_dir, temp_dir, file_id,
+                                db, blob, thumb_dir, temp_dir, file_id,
                             );
                         }
                         "mp4" | "avi" | "mkv" | "mov" | "wmv" | "flv" | "webm" => {
                             let _ = storage::generate_video_thumbnail(
-                                db, store_dir, thumb_dir, temp_dir, file_id,
+                                db, blob, thumb_dir, temp_dir, file_id,
                             );
                         }
                         _ => {}
@@ -193,8 +183,7 @@ fn import_directory(
                 }
             }
         } else if entry_path.is_dir() {
-            // Recursively import subdirectory
-            let result = import_directory(db, store_dir, thumb_dir, temp_dir, &entry_path, new_folder_id);
+            let result = import_directory(db, blob, thumb_dir, temp_dir, &entry_path, new_folder_id);
             success_count += result.0;
             fail_count += result.1;
             errors.extend(result.2);
@@ -215,15 +204,13 @@ fn export_files(
     let target = PathBuf::from(&target_dir);
     let mut exported = Vec::new();
 
-    // 导出文件
     for file_id in file_ids {
-        let path = storage::export_file(&state.db, &state.store_dir, file_id, &target)?;
+        let path = storage::export_file(&state.db, &state.blob, file_id, &target)?;
         exported.push(path.to_str().unwrap_or("").to_string());
     }
 
-    // 导出文件夹（递归）
     for folder_id in folder_ids {
-        export_folder_recursive(&state.db, &state.store_dir, folder_id, &target, &mut exported)?;
+        export_folder_recursive(&state.db, &state.blob, folder_id, &target, &mut exported)?;
     }
 
     Ok(exported)
@@ -231,37 +218,33 @@ fn export_files(
 
 fn export_folder_recursive(
     db: &Database,
-    store_dir: &Path,
+    blob: &BlobStore,
     folder_id: i64,
     target_base: &Path,
     exported: &mut Vec<String>,
 ) -> Result<(), String> {
-    // 获取文件夹信息
     let folders = db.get_folders().map_err(|e| e.to_string())?;
     let folder = folders.iter().find(|f| f.folder_id == folder_id)
         .ok_or_else(|| format!("文件夹 {} 不存在", folder_id))?;
-    
-    // 创建文件夹
+
     let folder_path = target_base.join(&folder.name);
     std::fs::create_dir_all(&folder_path).map_err(|e| format!("创建文件夹失败: {}", e))?;
-    
-    // 导出文件夹内的文件
+
     let files = db.get_files_in_folder(folder_id).map_err(|e| e.to_string())?;
     for file in files {
-        let path = storage::export_file(db, store_dir, file.file_id, &folder_path)?;
+        let path = storage::export_file(db, blob, file.file_id, &folder_path)?;
         exported.push(path.to_str().unwrap_or("").to_string());
     }
-    
-    // 递归导出子文件夹
+
     let sub_folders: Vec<i64> = folders.iter()
         .filter(|f| f.parent_id == Some(folder_id))
         .map(|f| f.folder_id)
         .collect();
-    
+
     for sub_folder_id in sub_folders {
-        export_folder_recursive(db, store_dir, sub_folder_id, &folder_path, exported)?;
+        export_folder_recursive(db, blob, sub_folder_id, &folder_path, exported)?;
     }
-    
+
     Ok(())
 }
 
@@ -273,14 +256,13 @@ fn open_file(
     let state = state.lock().unwrap();
     let temp_path = storage::extract_to_temp(
         &state.db,
-        &state.store_dir,
+        &state.blob,
         &state.temp_dir,
         file_id,
     )?;
 
     let path_str = temp_path.to_str().unwrap_or("").to_string();
 
-    // Open with system default application
     #[cfg(target_os = "windows")]
     {
         std::process::Command::new("cmd")
@@ -298,21 +280,27 @@ fn delete_file(
     file_id: i64,
 ) -> Result<(), String> {
     let state = state.lock().unwrap();
-    
-    // Get thumbnail path before deletion
+
     let thumb_path = state.db.get_thumbnail_path(file_id).map_err(|e| e.to_string())?;
-    
-    // Delete from database (free_space is recorded atomically in the transaction)
+
+    // 获取分片数量用于删除 emdb 中的分片
+    let file_info = state.db.get_file_info(file_id).map_err(|e| e.to_string())?;
+    let chunk_count = file_info.as_ref().map(|f| storage::get_chunk_count(f.size_bytes)).unwrap_or(0);
+
+    // 删除 DB 记录
     state.db.delete_file(file_id).map_err(|e| e.to_string())?;
-    
-    // Delete thumbnail file if exists
+
+    // 删除 emdb 中的分片
+    state.blob.delete_file_chunks(file_id, chunk_count)?;
+
+    // 删除缩略图
     if let Some(path) = thumb_path {
         let thumb_file = std::path::Path::new(&path);
         if thumb_file.exists() {
             let _ = std::fs::remove_file(thumb_file);
         }
     }
-    
+
     Ok(())
 }
 
@@ -322,35 +310,47 @@ fn delete_folder(
     folder_id: i64,
 ) -> Result<(), String> {
     let state = state.lock().unwrap();
-    
-    // 保护根目录（parent_id IS NULL 的文件夹）
+
     let folders = state.db.get_folders().map_err(|e| e.to_string())?;
     if let Some(folder) = folders.iter().find(|f| f.folder_id == folder_id) {
         if folder.parent_id.is_none() {
             return Err("不能删除根目录".to_string());
         }
     }
-    
-    // Get all thumbnail paths before deletion
+
+    // 收集缩略图路径和文件信息
     let file_ids = state.db.get_all_file_ids_in_folder_recursive(folder_id).map_err(|e| e.to_string())?;
     let mut thumb_paths = Vec::new();
+    let mut file_chunk_info: Vec<(i64, i32)> = Vec::new();
     for file_id in &file_ids {
         if let Ok(Some(thumb_path)) = state.db.get_thumbnail_path(*file_id) {
             thumb_paths.push(thumb_path);
         }
+        if let Ok(Some(info)) = state.db.get_file_info(*file_id) {
+            file_chunk_info.push((*file_id, storage::get_chunk_count(info.size_bytes)));
+        }
     }
-    
-    // Delete folder and all associated database records (free_space recorded atomically)
-    state.db.delete_folder(folder_id).map_err(|e| e.to_string())?;
-    
-    // Delete all thumbnail files
+
+    // 删除 DB 记录（返回受影响的 file_id）
+    let deleted_file_ids = state.db.delete_folder(folder_id).map_err(|e| e.to_string())?;
+
+    // 删除 emdb 中的分片
+    for file_id in &deleted_file_ids {
+        let chunk_count = file_chunk_info.iter()
+            .find(|(fid, _)| fid == file_id)
+            .map(|(_, c)| *c)
+            .unwrap_or(0);
+        state.blob.delete_file_chunks(*file_id, chunk_count)?;
+    }
+
+    // 删除缩略图
     for path in thumb_paths {
         let thumb_file = std::path::Path::new(&path);
         if thumb_file.exists() {
             let _ = std::fs::remove_file(thumb_file);
         }
     }
-    
+
     Ok(())
 }
 
@@ -361,10 +361,8 @@ fn rename_file(
     new_name: String,
 ) -> Result<(), String> {
     let state = state.lock().unwrap();
-    // 获取文件当前所在文件夹
     let folder_id = state.db.get_file_folder_id(file_id).map_err(|e| e.to_string())?
         .ok_or_else(|| "文件不存在".to_string())?;
-    // Windows风格：同级不能有同名文件
     if state.db.check_file_name_in_folder(folder_id, &new_name, Some(file_id)).map_err(|e| e.to_string())? {
         return Err(format!("该文件夹下已存在名为 '{}' 的文件", new_name));
     }
@@ -378,10 +376,8 @@ fn rename_folder(
     new_name: String,
 ) -> Result<(), String> {
     let state = state.lock().unwrap();
-    // 获取文件夹的父文件夹
     let folders = state.db.get_folders().map_err(|e| e.to_string())?;
     let parent_id = folders.iter().find(|f| f.folder_id == folder_id).and_then(|f| f.parent_id);
-    // Windows风格：同级不能有同名文件夹
     if state.db.check_folder_name_in_parent(parent_id, &new_name, Some(folder_id)).map_err(|e| e.to_string())? {
         return Err(format!("该文件夹下已存在名为 '{}' 的文件夹", new_name));
     }
@@ -395,10 +391,8 @@ fn move_file(
     target_folder_id: i64,
 ) -> Result<(), String> {
     let state = state.lock().unwrap();
-    // 获取文件名
     let file_info = state.db.get_file_info(file_id).map_err(|e| e.to_string())?
         .ok_or_else(|| "文件不存在".to_string())?;
-    // Windows风格：目标文件夹下不能有同名文件
     if state.db.check_file_name_in_folder(target_folder_id, &file_info.name, Some(file_id)).map_err(|e| e.to_string())? {
         return Err(format!("目标文件夹下已存在名为 '{}' 的文件", file_info.name));
     }
@@ -415,11 +409,9 @@ fn move_folder(
     let folders = state.db.get_folders().map_err(|e| e.to_string())?;
     let folder = folders.iter().find(|f| f.folder_id == folder_id)
         .ok_or_else(|| "文件夹不存在".to_string())?;
-    // 不能移动到自身或自身的子文件夹
     if target_parent_id == Some(folder_id) {
         return Err("不能将文件夹移动到自身".to_string());
     }
-    // 检查是否是子文件夹（防止循环引用）
     let mut check_id = target_parent_id;
     while let Some(pid) = check_id {
         if pid == folder_id {
@@ -427,7 +419,6 @@ fn move_folder(
         }
         check_id = folders.iter().find(|f| f.folder_id == pid).and_then(|f| f.parent_id);
     }
-    // Windows风格：目标父文件夹下不能有同名文件夹
     if state.db.check_folder_name_in_parent(target_parent_id, &folder.name, Some(folder_id)).map_err(|e| e.to_string())? {
         return Err(format!("目标文件夹下已存在名为 '{}' 的文件夹", folder.name));
     }
@@ -490,7 +481,6 @@ fn list_dir(dir_path: String) -> Result<Vec<DirEntry>, String> {
         }
     }
 
-    // Sort: folders first, then files, both alphabetically
     entries.sort_by(|a, b| {
         match (a.is_dir, b.is_dir) {
             (true, false) => std::cmp::Ordering::Less,
@@ -504,7 +494,6 @@ fn list_dir(dir_path: String) -> Result<Vec<DirEntry>, String> {
 
 // ==================== 前后端分离命令 ====================
 
-/// 获取文件夹完整内容（子文件夹 + 文件），前端无需做任何合并
 #[tauri::command]
 fn get_folder_contents(
     state: tauri::State<Mutex<AppState>>,
@@ -516,7 +505,6 @@ fn get_folder_contents(
 
     let mut items: Vec<FolderContentsItem> = Vec::new();
 
-    // 子文件夹
     for f in &all_folders {
         if f.parent_id == Some(folder_id) {
             items.push(FolderContentsItem {
@@ -532,7 +520,6 @@ fn get_folder_contents(
         }
     }
 
-    // 文件
     for file in &files {
         items.push(FolderContentsItem {
             id: file.file_id,
@@ -549,7 +536,6 @@ fn get_folder_contents(
     Ok(FolderContents { items })
 }
 
-/// 获取面包屑路径，后端负责路径拼装
 #[tauri::command]
 fn get_breadcrumb_path(
     state: tauri::State<Mutex<AppState>>,
@@ -571,17 +557,17 @@ fn get_breadcrumb_path(
     Ok(path)
 }
 
-/// 批量删除（混合文件和文件夹ID），后端负责类型判断
-/// free_space在db层事务中原子记录，无需调用方单独处理
+// ==================== 批量操作 ====================
+
 #[tauri::command]
 fn batch_delete(
     state: tauri::State<Mutex<AppState>>,
     file_ids: Vec<i64>,
     folder_ids: Vec<i64>,
 ) -> Result<BatchResult, String> {
-    let (db, store_dir) = {
+    let (db, blob) = {
         let state = state.lock().unwrap();
-        (state.db.clone(), state.store_dir.clone())
+        (state.db.clone(), state.blob.clone())
     };
     let state_ref = state.lock().unwrap();
     let mut success_count = 0;
@@ -590,28 +576,38 @@ fn batch_delete(
 
     // 删除文件夹
     for folder_id in &folder_ids {
-        // 保护根目录
         let folders = state_ref.db.get_folders().map_err(|e| e.to_string())?;
         if let Some(folder) = folders.iter().find(|f| f.folder_id == *folder_id) {
             if folder.parent_id.is_none() {
                 fail_count += 1;
-                errors.push(format!("不能删除根目录"));
+                errors.push("不能删除根目录".to_string());
                 continue;
             }
         }
 
-        // 收集缩略图路径（只读）
         let mut thumbs_to_delete = Vec::new();
-        if let Ok(file_ids) = state_ref.db.get_all_file_ids_in_folder_recursive(*folder_id) {
-            for file_id in &file_ids {
-                if let Ok(Some(thumb_path)) = state_ref.db.get_thumbnail_path(*file_id) {
+        let mut file_chunk_info: Vec<(i64, i32)> = Vec::new();
+        if let Ok(fids) = state_ref.db.get_all_file_ids_in_folder_recursive(*folder_id) {
+            for fid in &fids {
+                if let Ok(Some(thumb_path)) = state_ref.db.get_thumbnail_path(*fid) {
                     thumbs_to_delete.push(thumb_path);
+                }
+                if let Ok(Some(info)) = state_ref.db.get_file_info(*fid) {
+                    file_chunk_info.push((*fid, storage::get_chunk_count(info.size_bytes)));
                 }
             }
         }
-        // DB删除（含free_space原子记录）
+
         match state_ref.db.delete_folder(*folder_id) {
-            Ok(_) => {
+            Ok(deleted_ids) => {
+                // 删除 emdb 分片
+                for fid in &deleted_ids {
+                    let cc = file_chunk_info.iter()
+                        .find(|(f, _)| f == fid)
+                        .map(|(_, c)| *c)
+                        .unwrap_or(0);
+                    let _ = state_ref.blob.delete_file_chunks(*fid, cc);
+                }
                 for thumb_path in &thumbs_to_delete {
                     let thumb_file = std::path::Path::new(thumb_path);
                     if thumb_file.exists() {
@@ -630,8 +626,12 @@ fn batch_delete(
     // 删除文件
     for file_id in &file_ids {
         let thumb_path = state_ref.db.get_thumbnail_path(*file_id).ok().flatten();
+        let chunk_count = state_ref.db.get_file_info(*file_id).ok().flatten()
+            .map(|f| storage::get_chunk_count(f.size_bytes))
+            .unwrap_or(0);
         match state_ref.db.delete_file(*file_id) {
             Ok(_) => {
+                let _ = state_ref.blob.delete_file_chunks(*file_id, chunk_count);
                 if let Some(path) = thumb_path {
                     let thumb_file = std::path::Path::new(&path);
                     if thumb_file.exists() {
@@ -653,11 +653,10 @@ fn batch_delete(
         success_count,
         fail_count,
         errors,
-        cleanup_recommended: check_cleanup_recommended(&db, &store_dir),
+        cleanup_recommended: check_cleanup_recommended(&db, &blob),
     })
 }
 
-/// 批量移动（分离文件和文件夹ID）
 #[tauri::command]
 fn batch_move(
     state: tauri::State<Mutex<AppState>>,
@@ -671,14 +670,12 @@ fn batch_move(
     let mut fail_count = 0;
     let mut errors = Vec::new();
 
-    // 移动文件夹
     for folder_id in &folder_ids {
         if *folder_id == target_folder_id {
             fail_count += 1;
             errors.push("不能将文件夹移动到自身".to_string());
             continue;
         }
-        // 防止循环引用
         let mut check_id = Some(target_folder_id);
         let mut is_circular = false;
         while let Some(pid) = check_id {
@@ -708,7 +705,6 @@ fn batch_move(
         }
     }
 
-    // 移动文件
     for file_id in &file_ids {
         let file_info = state.db.get_file_info(*file_id).map_err(|e| e.to_string())?
             .ok_or_else(|| "文件不存在".to_string())?;
@@ -729,7 +725,6 @@ fn batch_move(
     Ok(BatchResult { success_count, fail_count, errors, cleanup_recommended: false })
 }
 
-/// 批量导出（分离文件和文件夹ID）
 #[tauri::command]
 fn batch_export(
     state: tauri::State<Mutex<AppState>>,
@@ -741,14 +736,12 @@ fn batch_export(
     let target = PathBuf::from(&target_dir);
     let mut exported = Vec::new();
 
-    // 导出文件夹
     for folder_id in &folder_ids {
-        export_folder_recursive(&state.db, &state.store_dir, *folder_id, &target, &mut exported)?;
+        export_folder_recursive(&state.db, &state.blob, *folder_id, &target, &mut exported)?;
     }
 
-    // 导出文件
     for file_id in &file_ids {
-        let path = storage::export_file(&state.db, &state.store_dir, *file_id, &target)?;
+        let path = storage::export_file(&state.db, &state.blob, *file_id, &target)?;
         exported.push(path.to_str().unwrap_or("").to_string());
     }
 
@@ -759,23 +752,12 @@ fn batch_export(
 
 const CLEANUP_THRESHOLD: i64 = 4 * 1024 * 1024 * 1024; // 4GB
 
-fn check_cleanup_recommended(db: &Database, store_dir: &Path) -> bool {
-    if let Ok((_, free_space)) = db.get_storage_stats() {
+fn check_cleanup_recommended(db: &Database, blob: &BlobStore) -> bool {
+    if let Ok(logical_size) = db.get_logical_size() {
+        let physical = blob.file_size() as i64;
+        let free_space = physical - logical_size;
         if free_space >= CLEANUP_THRESHOLD {
             return true;
-        }
-    }
-    // 也检查物理文件大小
-    let store_path = store_dir.join("store.bin");
-    if let Ok(meta) = std::fs::metadata(&store_path) {
-        let physical = meta.len() as i64;
-        if physical >= CLEANUP_THRESHOLD {
-            if let Ok((logical, _)) = db.get_storage_stats() {
-                let free_space = physical - logical;
-                if free_space >= CLEANUP_THRESHOLD {
-                    return true;
-                }
-            }
         }
     }
     false
@@ -786,21 +768,9 @@ fn get_storage_stats(
     state: tauri::State<Mutex<AppState>>,
 ) -> Result<StorageStats, String> {
     let state = state.lock().unwrap();
-    let (logical_size, free_space_db) = state.db.get_storage_stats()?;
-
-    // 计算物理大小：所有 store 文件的实际大小
-    let mut physical_size: i64 = 0;
-    if let Ok(entries) = std::fs::read_dir(&state.store_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("store") && name.ends_with(".bin") {
-                physical_size += entry.metadata().map(|m| m.len() as i64).unwrap_or(0);
-            }
-        }
-    }
-
-    // free_space 取 DB 记录和物理差值中的较大值
-    let free_space = std::cmp::max(free_space_db, physical_size - logical_size);
+    let logical_size = state.db.get_logical_size()?;
+    let physical_size = state.blob.file_size() as i64;
+    let free_space = std::cmp::max(0, physical_size - logical_size);
     let cleanup_recommended = free_space >= CLEANUP_THRESHOLD;
 
     Ok(StorageStats {
@@ -815,12 +785,14 @@ fn get_storage_stats(
 fn compact_store(
     state: tauri::State<Mutex<AppState>>,
 ) -> Result<CompactResult, String> {
-    let (db, store_dir) = {
-        let state = state.lock().unwrap();
-        (state.db.clone(), state.store_dir.clone())
-    };
+    let state = state.lock().unwrap();
+    let old_physical = state.blob.file_size() as i64;
 
-    let (freed_bytes, old_physical, new_physical) = storage::compact_store(&db, &store_dir)?;
+    // emdb 内置压缩：重写有效记录，释放已删除数据空间
+    state.blob.compact()?;
+
+    let new_physical = state.blob.file_size() as i64;
+    let freed_bytes = old_physical - new_physical;
 
     Ok(CompactResult {
         freed_bytes,
@@ -850,19 +822,23 @@ fn get_app_data_dir() -> PathBuf {
 
 fn get_db_subdirs(db_dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
     (
-        db_dir.join("store"),
+        db_dir.join("thumb_cache"),
         db_dir.join("thumb_cache"),
         db_dir.join("temp"),
     )
 }
 
 fn create_db_dirs(db_dir: &Path) -> Result<(PathBuf, PathBuf, PathBuf), String> {
-    let (store_dir, thumb_dir, temp_dir) = get_db_subdirs(db_dir);
-    std::fs::create_dir_all(&store_dir).map_err(|e| format!("创建store目录失败: {}", e))?;
+    let (thumb_dir, _, temp_dir) = get_db_subdirs(db_dir);
     std::fs::create_dir_all(thumb_dir.join("img")).map_err(|e| format!("创建thumb目录失败: {}", e))?;
     std::fs::create_dir_all(thumb_dir.join("vid")).ok();
     std::fs::create_dir_all(&temp_dir).map_err(|e| format!("创建temp目录失败: {}", e))?;
-    Ok((store_dir, thumb_dir, temp_dir))
+    Ok((thumb_dir.clone(), thumb_dir, temp_dir))
+}
+
+fn open_blob_store(db_dir: &Path) -> Result<BlobStore, String> {
+    let emdb_path = db_dir.join("blobs.emdb");
+    BlobStore::open(&emdb_path)
 }
 
 #[allow(dead_code)]
@@ -935,7 +911,7 @@ fn create_database(
     if db_dir.join("metadata.db").exists() {
         return Err("该路径已存在数据库".to_string());
     }
-    let (store_dir, _thumb_dir, _temp_dir) = create_db_dirs(&db_dir)?;
+    create_db_dirs(&db_dir)?;
     let db_path = db_dir.join("metadata.db");
     let database = Database::new(&db_path).map_err(|e| e.to_string())?;
     let uuid = uuid::Uuid::new_v4().to_string();
@@ -947,8 +923,9 @@ fn create_database(
             database.set_password_hash(Some(&hash_password(pw))).map_err(|e| e.to_string())?;
         }
     }
+    // 初始化空的 emdb 文件
+    let _ = open_blob_store(&db_dir)?;
     drop(database);
-    drop(store_dir);
     let mut state = state.lock().unwrap();
     state.registry.add_connection(DbConnection {
         uuid: uuid.clone(),
@@ -983,7 +960,6 @@ fn connect_database(
             return Err("密码错误".to_string());
         }
     } else if password.is_some() {
-        // No password set but one was provided - that's fine, just ignore
     }
     let (valid, details) = database.check_integrity().map_err(|e| e.to_string())?;
     if !valid {
@@ -1056,14 +1032,16 @@ fn switch_database(
     let conn = state.registry.get_connection(&uuid)
         .ok_or("数据库未找到")?
         .clone();
-    let db_path = PathBuf::from(&conn.path).join("metadata.db");
+    let db_dir = PathBuf::from(&conn.path);
+    let db_path = db_dir.join("metadata.db");
     if !db_path.exists() {
         return Err("数据库文件不存在".to_string());
     }
     let database = Database::new(&db_path).map_err(|e| e.to_string())?;
-    let (store_dir, thumb_dir, temp_dir) = create_db_dirs(Path::new(&conn.path))?;
+    let blob = open_blob_store(&db_dir)?;
+    let (thumb_dir, _, temp_dir) = create_db_dirs(&db_dir)?;
     state.db = database;
-    state.store_dir = store_dir;
+    state.blob = blob;
     state.thumb_dir = thumb_dir;
     state.temp_dir = temp_dir;
     state.current_db_uuid = uuid;
@@ -1162,7 +1140,7 @@ fn change_database_path(
     }
     std::fs::create_dir_all(&new_dir).map_err(|e| format!("创建目标目录失败: {}", e))?;
     // 迁移文件
-    let items = ["metadata.db", "metadata.db-wal", "metadata.db-shm"];
+    let items = ["metadata.db", "metadata.db-wal", "metadata.db-shm", "blobs.emdb"];
     for item in &items {
         let src = old_dir.join(item);
         let dst = new_dir.join(item);
@@ -1171,7 +1149,7 @@ fn change_database_path(
                 .map_err(|e| format!("迁移{}失败: {}", item, e))?;
         }
     }
-    let dir_items = ["store", "thumb_cache"];
+    let dir_items = ["thumb_cache"];
     for item in &dir_items {
         let src = old_dir.join(item);
         let dst = new_dir.join(item);
@@ -1189,8 +1167,7 @@ fn change_database_path(
     state.registry.update_path(&uuid, new_path.clone())?;
     // 如果迁移的是当前数据库，更新路径
     if state.current_db_uuid == uuid {
-        let (store_dir, thumb_dir, temp_dir) = get_db_subdirs(&new_dir);
-        state.store_dir = store_dir;
+        let (thumb_dir, _, temp_dir) = get_db_subdirs(&new_dir);
         state.thumb_dir = thumb_dir;
         state.temp_dir = temp_dir;
     }
@@ -1323,11 +1300,9 @@ fn change_default_db_path(
     if old_dir == new_dir {
         return Err("新路径与当前路径相同".to_string());
     }
-    // 创建新目录结构
     std::fs::create_dir_all(&new_dir).map_err(|e| format!("创建目录失败: {}", e))?;
     let new_db_path = new_dir.join("metadata.db");
     if new_db_path.exists() {
-        // 目标已有数据库，检查是否有效
         match Database::new(&new_db_path) {
             Ok(db) => {
                 let props = db.get_db_properties().map_err(|e| e.to_string())?;
@@ -1336,15 +1311,13 @@ fn change_default_db_path(
                 }
             }
             Err(_) => {
-                // 无效数据库，备份后覆盖
                 let backup = new_dir.with_extension("bak");
                 let _ = std::fs::rename(&new_dir, &backup);
                 std::fs::create_dir_all(&new_dir).ok();
             }
         }
     }
-    // 迁移文件
-    let items = ["metadata.db", "metadata.db-wal", "metadata.db-shm"];
+    let items = ["metadata.db", "metadata.db-wal", "metadata.db-shm", "blobs.emdb"];
     for item in &items {
         let src = old_dir.join(item);
         let dst = new_dir.join(item);
@@ -1353,7 +1326,7 @@ fn change_default_db_path(
                 .map_err(|e| format!("迁移{}失败: {}", item, e))?;
         }
     }
-    let dir_items = ["store", "thumb_cache"];
+    let dir_items = ["thumb_cache"];
     for item in &dir_items {
         let src = old_dir.join(item);
         let dst = new_dir.join(item);
@@ -1364,16 +1337,12 @@ fn change_default_db_path(
             std::fs::rename(&src, &dst).map_err(|e| format!("迁移{}失败: {}", item, e))?;
         }
     }
-    // 清理旧目录
     if old_dir.exists() {
         let _ = std::fs::remove_dir_all(&old_dir);
     }
-    // 更新注册表
     state.registry.update_path(&default_conn.uuid, new_path.clone())?;
     state.registry.set_default_db_path(new_path.clone());
-    // 更新当前状态
-    let (store_dir, thumb_dir, temp_dir) = get_db_subdirs(&new_dir);
-    state.store_dir = store_dir;
+    let (thumb_dir, _, temp_dir) = get_db_subdirs(&new_dir);
     state.thumb_dir = thumb_dir;
     state.temp_dir = temp_dir;
     Ok(())
@@ -1389,7 +1358,6 @@ pub fn run() {
             let app_data_dir = get_app_data_dir();
             std::fs::create_dir_all(&app_data_dir).ok();
 
-            // 确保 ffmpeg 可用
             let _ = ffmpeg_sidecar::download::auto_download();
 
             // 加载注册表
@@ -1413,7 +1381,7 @@ pub fn run() {
                         let _ = std::fs::rename(&src, &dst);
                     }
                 }
-                let legacy_dirs = ["store", "thumb_cache"];
+                let legacy_dirs = ["thumb_cache"];
                 for item in &legacy_dirs {
                     let src = legacy_dir.join(item);
                     let dst = default_db_dir.join(item);
@@ -1426,11 +1394,13 @@ pub fn run() {
             }
 
             // 初始化默认数据库
-            let (store_dir, thumb_dir, temp_dir) = create_db_dirs(&default_db_dir)
+            let (thumb_dir, _, temp_dir) = create_db_dirs(&default_db_dir)
                 .expect("无法创建默认数据库目录");
 
             let db_path = default_db_dir.join("metadata.db");
             let database = Database::new(&db_path).expect("无法初始化数据库");
+            let blob = open_blob_store(&default_db_dir)
+                .expect("无法初始化 blob store");
 
             // 注册默认数据库
             if registry.get_default_connection().is_none() {
@@ -1451,21 +1421,9 @@ pub fn run() {
                 .map(|c| c.uuid.clone())
                 .unwrap_or_default();
 
-            // 连接其他已注册的数据库（仅记录，不打开）
-            let connections = registry.connections().to_vec();
-            for conn in &connections {
-                if conn.is_default {
-                    continue; // 默认数据库已在上面打开
-                }
-                let conn_db_path = PathBuf::from(&conn.path).join("metadata.db");
-                if !conn_db_path.exists() {
-                    continue; // 跳过不存在的数据库
-                }
-            }
-
             let state = AppState {
                 db: database,
-                store_dir,
+                blob,
                 thumb_dir,
                 temp_dir,
                 registry,
